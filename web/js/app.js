@@ -71,6 +71,29 @@ document.addEventListener("DOMContentLoaded", () => {
         _poll: null,
         _jobsPoll: null,
         evalDatasetId: "",
+        cropPanel: {
+          show: false,
+          dest: null,
+          source: "zip",
+          srcDatasetId: "",
+          zipFile: null,
+          busy: false,
+          msg: "",
+          taskId: null,
+          preview: null,
+          params: {
+            model: "yolo26n.pt",
+            target_class: "person",
+            conf: 0.25,
+            imgsz: 1280,
+            min_box_h: 100,
+            pad_ratio: 0.25,
+            top_ratio: -0.15,
+            bottom_ratio: 0.55,
+            max_crops: 8000,
+            preview_limit: 20,
+          },
+        },
       };
     },
     computed: {
@@ -310,6 +333,113 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
           const t = await YS.api(`/api/datasets/${d.id}/dedup`, { method: "POST" });
           this.pollTask(t.id, d.id);
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      openCropImport(d) {
+        this.cropPanel.show = true;
+        this.cropPanel.dest = d;
+        this.cropPanel.source = "zip";
+        this.cropPanel.srcDatasetId = "";
+        this.cropPanel.zipFile = null;
+        this.cropPanel.busy = false;
+        this.cropPanel.msg = "";
+        this.cropPanel.taskId = null;
+        this.cropPanel.preview = null;
+      },
+      closeCropImport() {
+        this.cropPanel.show = false;
+        this.cropPanel.busy = false;
+      },
+      onCropZipPick(e) {
+        const f = e.target.files && e.target.files[0];
+        this.cropPanel.zipFile = f || null;
+      },
+      cropParamsJson() {
+        return JSON.stringify(this.cropPanel.params || {});
+      },
+      async runCropPreview() {
+        const d = this.cropPanel.dest;
+        if (!d) return;
+        this.cropPanel.busy = true;
+        this.cropPanel.msg = "预览中（CPU 检测大图较慢）…";
+        this.cropPanel.preview = null;
+        try {
+          const fd = new FormData();
+          fd.append("params", this.cropParamsJson());
+          if (this.cropPanel.source === "zip") {
+            if (!this.cropPanel.zipFile) throw new Error("请先选择大图 ZIP");
+            fd.append("file", this.cropPanel.zipFile);
+          } else {
+            if (!this.cropPanel.srcDatasetId) throw new Error("请选择源数据集");
+            fd.append("src_dataset_id", this.cropPanel.srcDatasetId);
+          }
+          const r = await YS.api(`/api/datasets/${d.id}/crop-import/preview`, {
+            method: "POST",
+            body: fd,
+          });
+          this.cropPanel.preview = r;
+          this.cropPanel.msg = `预览完成：${r.crop_count || 0} 张切图`;
+          if (!(r.items || []).length) {
+            this.showToast("没有切出任何图，可调低 conf 或检查类别名是否为 person");
+          }
+        } catch (e) {
+          this.cropPanel.msg = e.message;
+          this.showToast(e.message);
+        } finally {
+          this.cropPanel.busy = false;
+        }
+      },
+      async runCropFull() {
+        const d = this.cropPanel.dest;
+        if (!d) return;
+        this.cropPanel.busy = true;
+        this.cropPanel.msg = "提交全量切图任务…";
+        try {
+          let t;
+          if (this.cropPanel.source === "zip") {
+            if (!this.cropPanel.zipFile) throw new Error("请先选择大图 ZIP");
+            const fd = new FormData();
+            fd.append("file", this.cropPanel.zipFile);
+            fd.append("params", this.cropParamsJson());
+            t = await YS.api(`/api/datasets/${d.id}/crop-import/zip`, {
+              method: "POST",
+              body: fd,
+            });
+          } else {
+            if (!this.cropPanel.srcDatasetId) throw new Error("请选择源数据集");
+            t = await YS.api(
+              `/api/datasets/${d.id}/crop-import/from/${this.cropPanel.srcDatasetId}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(this.cropPanel.params),
+              }
+            );
+          }
+          this.cropPanel.taskId = t.id;
+          this.taskMsg[d.id] = "智能切图排队中…";
+          this.pollTask(t.id, d.id).then((done) => {
+            if (done && done.status === "success") {
+              this.showToast(done.message || "切图完成，可以开始标注了");
+              this.cropPanel.msg = done.message || "完成";
+            }
+          });
+          this.cropPanel.msg = `任务已提交 ${t.id}，可关闭面板，进度在数据集卡片上查看`;
+        } catch (e) {
+          this.cropPanel.msg = e.message;
+          this.showToast(e.message);
+        } finally {
+          this.cropPanel.busy = false;
+        }
+      },
+      async cancelCropTask() {
+        if (!this.cropPanel.taskId) return;
+        try {
+          await YS.api(`/api/tasks/${this.cropPanel.taskId}/cancel`, { method: "POST" });
+          this.cropPanel.msg = "已请求取消";
+          this.showToast("已取消切图任务（已入库的切图会保留）");
         } catch (e) {
           this.showToast(e.message);
         }

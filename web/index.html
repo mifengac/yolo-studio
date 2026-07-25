@@ -64,6 +64,7 @@
               <button @click="uploadFiles(d)">上传图片</button>
               <button @click="uploadZip(d)">导入 ZIP</button>
               <button @click="uploadVideo(d)">导入视频</button>
+              <button class="primary" @click="openCropImport(d)">智能切图导入</button>
               <button @click="runAutolabel(d)">模型预标注</button>
               <button @click="runOpenvocab(d)">开放词表</button>
               <button @click="runTrack(d)">视频跟踪传播</button>
@@ -75,6 +76,73 @@
           </div>
         </div>
         <p v-if="!datasets.length" class="muted">还没有数据集，点右上角新建一个。</p>
+
+        <!-- 智能切图导入面板 -->
+        <div v-if="cropPanel.show" class="modal-mask" @click.self="closeCropImport">
+          <div class="modal-card crop-panel">
+            <div class="row between">
+              <h3>智能切图导入 → {{ cropPanel.dest && cropPanel.dest.name }}</h3>
+              <button @click="closeCropImport">关闭</button>
+            </div>
+            <p class="hint">
+              用检测模型（默认 yolo26n / person）从卡口大图切出上半身，切图入库供头盔等小目标标注。
+              原图不入库；同一张原图的切图共享 group_key，训练时不会拆到 train/val 两边。
+            </p>
+            <div class="row wrap">
+              <label>来源
+                <select v-model="cropPanel.source">
+                  <option value="zip">上传大图 ZIP</option>
+                  <option value="dataset">从已有数据集</option>
+                </select>
+              </label>
+              <label v-if="cropPanel.source==='zip'">ZIP 文件
+                <input type="file" accept=".zip" @change="onCropZipPick" />
+              </label>
+              <label v-if="cropPanel.source==='dataset'">源数据集（大图）
+                <select v-model="cropPanel.srcDatasetId">
+                  <option value="">（选择）</option>
+                  <option v-for="s in datasets.filter(x => cropPanel.dest && x.id !== cropPanel.dest.id)" :key="s.id" :value="s.id">
+                    {{ s.name }}（{{ s.image_count || 0 }} 张）
+                  </option>
+                </select>
+              </label>
+            </div>
+            <details class="crop-advanced">
+              <summary>高级参数（一般不用改）</summary>
+              <div class="row wrap">
+                <label>模型 <input v-model="cropPanel.params.model" /></label>
+                <label>类别名 <input v-model="cropPanel.params.target_class" /></label>
+                <label>置信度 <input type="number" step="0.05" v-model.number="cropPanel.params.conf" /></label>
+                <label>检测尺寸 imgsz <input type="number" v-model.number="cropPanel.params.imgsz" /></label>
+                <label>最小框高 <input type="number" v-model.number="cropPanel.params.min_box_h" /></label>
+                <label>左右外扩 pad_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.pad_ratio" /></label>
+                <label>上扩 top_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.top_ratio" /></label>
+                <label>下切 bottom_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.bottom_ratio" /></label>
+                <label>预览大图数 <input type="number" v-model.number="cropPanel.params.preview_limit" /></label>
+                <label>单次最多切图 <input type="number" v-model.number="cropPanel.params.max_crops" /></label>
+              </div>
+            </details>
+            <div class="row wrap" style="margin-top:10px">
+              <button class="primary" @click="runCropPreview" :disabled="cropPanel.busy">先预览 20 张</button>
+              <button class="primary" @click="runCropFull" :disabled="cropPanel.busy">开始全量切图</button>
+              <button v-if="cropPanel.taskId" @click="cancelCropTask">取消任务</button>
+            </div>
+            <div v-if="cropPanel.msg" class="task-msg">{{ cropPanel.msg }}</div>
+            <div v-if="cropPanel.preview && cropPanel.preview.items && cropPanel.preview.items.length" class="crop-grid">
+              <div class="muted" style="grid-column:1/-1">
+                预览：处理 {{ cropPanel.preview.source_images }} 张大图，切出 {{ cropPanel.preview.crop_count }} 张
+                <span v-if="cropPanel.preview.no_target_files && cropPanel.preview.no_target_files.length">
+                  · 未检出 {{ cropPanel.preview.no_target_files.length }} 张
+                </span>
+                。请确认头部完整、清晰后再全量切图。
+              </div>
+              <div class="crop-thumb" v-for="(it, i) in cropPanel.preview.items" :key="i">
+                <img :src="'data:image/jpeg;base64,' + it.thumb_b64" :alt="it.filename" />
+                <div class="muted" style="font-size:11px">{{ it.filename }} · {{ it.w }}×{{ it.h }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- 标注工作台 -->

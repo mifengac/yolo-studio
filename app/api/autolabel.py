@@ -117,3 +117,22 @@ def get_task(task_id: str):
     if not t:
         raise HTTPException(404, "任务不存在")
     return t
+
+
+@router.post("/tasks/{task_id}/cancel")
+def cancel_task(task_id: str):
+    """取消排队/运行中的后台任务（切图等循环会检查 status）。"""
+    t = task_mod.get_task(task_id)
+    if not t:
+        raise HTTPException(404, "任务不存在")
+    if t.get("status") in ("success", "failed", "canceled"):
+        return t
+    from app import db
+
+    task_mod.update_task(
+        task_id,
+        status="canceled",
+        message="用户取消",
+        finished_at=db.utcnow(),
+    )
+    return task_mod.get_task(task_id)

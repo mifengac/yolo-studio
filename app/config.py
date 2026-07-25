@@ -80,6 +80,7 @@ HEAVY_TASK_TYPES = frozenset(
         "openvino_export",
         "import_video",
         "dedup",  # pHash+DCT 重 CPU，不可与训练并发
+        "crop_import",  # 大图 imgsz=1280 切图，CPU 重任务
     }
 )
 

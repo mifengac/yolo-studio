@@ -20,6 +20,7 @@ from app import db, tasks  # noqa: E402
 from app.api import autolabel, datasets, images, models, system, train  # noqa: E402
 from app.services import (  # noqa: E402
     autolabel_svc,
+    crop_svc,
     dedup_svc,
     openvocab_svc,
     track_svc,
@@ -39,6 +40,7 @@ def _register_task_handlers() -> None:
     tasks.register_handler("train", train_svc.run_train_job)
     tasks.register_handler("openvino_export", model_svc.run_openvino_export)
     tasks.register_handler("import_video", track_svc.run_import_video)
+    tasks.register_handler("crop_import", crop_svc.run_crop_import)
 
 
 @asynccontextmanager

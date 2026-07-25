@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+import json
+
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app import config
-from app.schemas import DatasetCreate, DatasetUpdate
-from app.services import dataset_svc, track_svc
+from app.schemas import CropImportFromDataset, CropImportParams, DatasetCreate, DatasetUpdate
+from app.services import crop_svc, dataset_svc, track_svc
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
@@ -154,3 +156,107 @@ def next_unlabeled(dataset_id: str, after: str | None = None):
         return {"item": item}
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
+
+
+def _parse_crop_params(params_json: str | None) -> dict:
+    if not params_json:
+        return CropImportParams().model_dump()
+    try:
+        raw = json.loads(params_json)
+    except json.JSONDecodeError as e:
+        raise HTTPException(400, f"参数 JSON 无效: {e}") from e
+    return CropImportParams(**raw).model_dump()
+
+
+@router.post("/{dataset_id}/crop-import/zip")
+async def crop_import_zip(
+    dataset_id: str,
+    file: UploadFile = File(...),
+    params: str | None = Form(None),
+):
+    """上传大图 ZIP，后台智能切图入库（原图不入库）。"""
+    from app import tasks as task_mod
+
+    try:
+        dataset_svc.get_dataset(dataset_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    data = await file.read()
+    if len(data) > config.MAX_UPLOAD_BYTES:
+        raise HTTPException(400, f"ZIP 超过 {config.MAX_UPLOAD_MB} MB 限制")
+    try:
+        p = _parse_crop_params(params)
+        meta = crop_svc.save_zip_temp(dataset_id, data, file.filename or "upload.zip")
+    except (ValueError, FileNotFoundError) as e:
+        raise HTTPException(400, str(e)) from e
+    task = task_mod.create_task(
+        "crop_import",
+        {
+            "dataset_id": dataset_id,
+            "source": "zip",
+            "zip_path": meta["zip_path"],
+            **p,
+        },
+        dataset_id=dataset_id,
+        submit=True,
+    )
+    return task
+
+
+@router.post("/{dataset_id}/crop-import/from/{src_dataset_id}")
+def crop_import_from_dataset(dataset_id: str, src_dataset_id: str, body: CropImportFromDataset | None = None):
+    """从已有数据集（大图）切图到当前数据集。"""
+    from app import tasks as task_mod
+
+    body = body or CropImportFromDataset()
+    try:
+        dataset_svc.get_dataset(dataset_id)
+        dataset_svc.get_dataset(src_dataset_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    if dataset_id == src_dataset_id:
+        raise HTTPException(400, "源数据集不能与目标数据集相同，请新建一个切图数据集")
+    task = task_mod.create_task(
+        "crop_import",
+        {
+            "dataset_id": dataset_id,
+            "source": "dataset",
+            "src_dataset_id": src_dataset_id,
+            **body.model_dump(),
+        },
+        dataset_id=dataset_id,
+        submit=True,
+    )
+    return task
+
+
+@router.post("/{dataset_id}/crop-import/preview")
+async def crop_import_preview(
+    dataset_id: str,
+    file: UploadFile | None = File(None),
+    src_dataset_id: str | None = Form(None),
+    params: str | None = Form(None),
+):
+    """先切 N 张预览（默认 20），返回 base64 缩略图，不入库。"""
+    try:
+        dataset_svc.get_dataset(dataset_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    try:
+        p = _parse_crop_params(params)
+        if file is not None and file.filename:
+            data = await file.read()
+            if len(data) > config.MAX_UPLOAD_BYTES:
+                raise HTTPException(400, f"ZIP 超过 {config.MAX_UPLOAD_MB} MB 限制")
+            return crop_svc.preview_crops(source="zip", zip_bytes=data, params=p)
+        if src_dataset_id:
+            return crop_svc.preview_crops(
+                source="dataset", src_dataset_id=src_dataset_id, params=p
+            )
+        raise HTTPException(400, "请上传 ZIP，或指定源数据集 src_dataset_id")
+    except HTTPException:
+        raise
+    except (ValueError, FileNotFoundError, LookupError) as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:
+        raise HTTPException(500, f"预览失败: {e}") from e

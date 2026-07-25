@@ -67,6 +67,27 @@ class TrackRequest(BaseModel):
     conf: float = 0.25
 
 
+class CropImportParams(BaseModel):
+    """智能切图参数（默认值实测标定，勿随意改）。"""
+
+    model: str = "yolo26n.pt"
+    target_class: str = "person"
+    conf: float = 0.25
+    imgsz: int = 1280
+    min_box_h: int = 100
+    pad_ratio: float = 0.25
+    top_ratio: float = -0.15
+    bottom_ratio: float = 0.55
+    max_crops: int = 8000
+    preview_limit: int = 20
+
+
+class CropImportFromDataset(CropImportParams):
+    """从已有数据集切图到当前数据集。"""
+
+    pass
+
+
 class TrainEstimateRequest(BaseModel):
     dataset_id: str
     base_model: str = "weights/yolo26n.pt"
