@@ -171,8 +171,12 @@ def create_train_job(params: dict) -> dict:
     base_path, base_classes, is_ft = resolve_base_model(params.get("base_model", "yolo26n.pt"))
     check_finetune_compat(base_classes if is_ft else None, dataset["classes"])
 
-    # 以客户端提交的 epochs 为准；前端微调组会默认填 20
-    epochs = int(params.get("epochs", 20 if is_ft else config.DEFAULT_EPOCHS))
+    # epochs 未传时：微调 20 / 从零 40；前端显式传值时以客户端为准
+    epochs_raw = params.get("epochs", None)
+    if epochs_raw is None:
+        epochs = 20 if is_ft else int(config.DEFAULT_EPOCHS)
+    else:
+        epochs = int(epochs_raw)
     imgsz = int(params.get("imgsz", config.DEFAULT_IMGSZ))
     batch = int(params.get("batch", config.DEFAULT_BATCH))
     freeze = int(params.get("freeze", config.DEFAULT_FREEZE))
@@ -207,9 +211,10 @@ def create_train_job(params: dict) -> dict:
         )
 
     job_id = new_job_id()
-    run_dir = config.RUNS_DIR / job_id
+    # 绝对路径：启动恢复时靠 run_dir/job_id 匹配 /proc cmdline
+    run_dir = (config.RUNS_DIR / job_id).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
-    log_path = run_dir / "train.log"
+    log_path = (run_dir / "train.log").resolve()
     full_params = {
         **params,
         "epochs": epochs,
@@ -587,34 +592,28 @@ def _pid_alive(pid: Optional[int]) -> bool:
         return False
 
 
-def recover_interrupted_jobs() -> int:
-    """启动时扫描 running 任务：进程不在则标 interrupted（不自动重跑）。"""
-    with db._lock, db.connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM train_job WHERE status='running'"
-        ).fetchall()
-    n = 0
-    for r in rows:
-        if _pid_alive(r["pid"]):
-            # 服务重启后残留的孤儿训练进程：主动终止，避免永久占 running
-            try:
-                _kill_pid(int(r["pid"]))
-            except Exception as exc:
-                logger.warning("终止残留训练 pid=%s 失败: %s", r["pid"], exc)
-        resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
-        update_job(
-            r["id"],
-            status="interrupted",
-            finished_at=db.utcnow(),
-            pid=None,
-            resume_from=resume if Path(resume).is_file() else r["resume_from"],
-        )
-        append_log(
-            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
-            "服务重启，任务中断（请点「继续训练」从断点恢复）",
-        )
-        n += 1
-    return n
+def _is_our_train_process(pid: int, job: dict) -> bool:
+    """读 /proc/<pid>/cmdline，确认是本 job 的 ultralytics 训练进程。
+
+    防止容器重启后 pid 被无关进程复用，误 killpg 整组进程。
+    """
+    try:
+        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+    except (OSError, PermissionError):
+        return False
+    cmdline = raw.replace(b"\0", b" ").decode("utf-8", "ignore")
+    job_id = str(job.get("id") or "")
+    run_dir = ""
+    if job.get("run_dir"):
+        try:
+            run_dir = str(Path(job["run_dir"]).resolve())
+        except Exception:
+            run_dir = str(job["run_dir"])
+    # 训练命令含 -m ultralytics detect train；project/name 分别带 RUNS_DIR 与 job_id
+    has_yolo = "ultralytics" in cmdline or ("detect" in cmdline and "train" in cmdline)
+    has_job = bool(job_id) and job_id in cmdline
+    has_run = bool(run_dir) and run_dir in cmdline
+    return has_yolo and (has_job or has_run)
 
 
 def _kill_pid(pid: int) -> None:
@@ -639,17 +638,64 @@ def _kill_pid(pid: int) -> None:
             pass
 
 
-def kill_running_train_processes() -> int:
-    """关服务时杀掉所有 running 训练子进程，并标为 interrupted。"""
+def recover_interrupted_jobs() -> int:
+    """启动时扫描 running 任务：一律标 interrupted；仅确认是本 job 训练进程才杀。"""
     with db._lock, db.connect() as conn:
         rows = conn.execute(
             "SELECT * FROM train_job WHERE status='running'"
         ).fetchall()
     n = 0
     for r in rows:
+        job = dict(r)
         pid = r["pid"]
-        if pid:
+        if pid and _pid_alive(pid) and _is_our_train_process(int(pid), job):
+            try:
+                _kill_pid(int(pid))
+            except Exception as exc:
+                logger.warning("终止残留训练 pid=%s 失败: %s", pid, exc)
+        elif pid and _pid_alive(pid):
+            logger.warning(
+                "pid=%s 存活但不是本 job 的训练进程（疑似 pid 复用），跳过终止 job=%s",
+                pid,
+                r["id"],
+            )
+        resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
+        update_job(
+            r["id"],
+            status="interrupted",
+            finished_at=db.utcnow(),
+            pid=None,
+            resume_from=resume if Path(resume).is_file() else r["resume_from"],
+        )
+        append_log(
+            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
+            "服务重启，任务中断（请点「继续训练」从断点恢复）",
+        )
+        n += 1
+    return n
+
+
+def kill_running_train_processes() -> int:
+    """关服务时杀掉所有 running 训练子进程，并标为 interrupted。
+
+    关服时 pid 为本进程刚拉起的，仍用 cmdline 校验以免误伤。
+    """
+    with db._lock, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM train_job WHERE status='running'"
+        ).fetchall()
+    n = 0
+    for r in rows:
+        job = dict(r)
+        pid = r["pid"]
+        if pid and _pid_alive(pid) and _is_our_train_process(int(pid), job):
             _kill_pid(int(pid))
+        elif pid and _pid_alive(pid):
+            logger.warning(
+                "关服时 pid=%s 不是本 job 训练进程，跳过终止 job=%s",
+                pid,
+                r["id"],
+            )
         resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
         update_job(
             r["id"],
