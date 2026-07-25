@@ -79,6 +79,7 @@ HEAVY_TASK_TYPES = frozenset(
         "evaluate",
         "openvino_export",
         "import_video",
+        "dedup",  # pHash+DCT 重 CPU，不可与训练并发
     }
 )
 

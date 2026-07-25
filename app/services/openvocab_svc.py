@@ -73,14 +73,27 @@ def run_openvocab(task: dict) -> None:
         task_mod.set_progress(task_id, 100, "没有需要处理的图片")
         return
 
-    # 加载 YOLO-World 并设置类别
+    # 加载 YOLO-World 并设置类别（依赖 clip + ~/.cache/clip/ViT-B-32.pt）
     model = engine.load_model(model_path, prefer_openvino=False)
-    if hasattr(model, "set_classes"):
-        model.set_classes(list(prompts))
-    else:
+    if not hasattr(model, "set_classes"):
         raise RuntimeError(
             "当前模型不支持 set_classes，请确认 weights/yolov8s-worldv2.pt 是 YOLO-World 权重"
         )
+    try:
+        model.set_classes(list(prompts))
+    except ModuleNotFoundError as e:
+        raise RuntimeError(
+            "开放词表需要 CLIP 库。有网时执行："
+            "`pip install git+https://github.com/ultralytics/CLIP.git`，"
+            "并把 ViT-B-32.pt（约 338MB）放到 ~/.cache/clip/ "
+            "（或 weights/clip/ 后在镜像里拷到该路径）。"
+            f" 原始错误: {e}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"设置开放词表提示词失败: {e}。"
+            "请确认已离线放置 CLIP 权重 ViT-B-32.pt（见 docs/20260725_离线权重清单.md）。"
+        ) from e
 
     labeled = 0
     batch = max(1, min(4, config.INFER_BATCH_SIZE))  # 开放词表更重

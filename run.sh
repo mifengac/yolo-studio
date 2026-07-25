@@ -10,6 +10,12 @@ if [[ ! -d .venv ]]; then
     torch==2.13.0 torchvision==0.28.0 \
     --index-url https://download.pytorch.org/whl/cpu
   .venv/bin/pip install -r requirements.txt
+  # YOLO-World 开放词表
+  .venv/bin/pip install "git+https://github.com/ultralytics/CLIP.git" || true
+  mkdir -p "$HOME/.cache/clip"
+  if [[ -f weights/clip/ViT-B-32.pt ]]; then
+    cp -n weights/clip/ViT-B-32.pt "$HOME/.cache/clip/ViT-B-32.pt" || true
+  fi
 fi
 
 # 前端 vendor 若不存在则提示

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ _handlers: dict[str, Callable[[dict], None]] = {}
 _started = False
 # 重任务池内已排队/运行数（用于「等待其他重任务」文案；池 max_workers=1 保证串行）
 _heavy_inflight = 0
-_heavy_inflight_lock = __import__("threading").Lock()
+_heavy_inflight_lock = threading.Lock()
 
 
 def new_task_id(prefix: str = "task") -> str:
@@ -46,13 +47,16 @@ def start_workers() -> None:
 
 
 def stop_workers() -> None:
-    global _heavy_executor, _light_executor, _started
+    global _heavy_executor, _light_executor, _started, _heavy_inflight
     if _heavy_executor:
         _heavy_executor.shutdown(wait=False, cancel_futures=True)
         _heavy_executor = None
     if _light_executor:
         _light_executor.shutdown(wait=False, cancel_futures=True)
         _light_executor = None
+    # 池关闭后清空计数，避免只重启 workers 时文案永久「等待中」
+    with _heavy_inflight_lock:
+        _heavy_inflight = 0
     _started = False
 
 
@@ -154,7 +158,13 @@ def submit_task(task_id: str) -> None:
             if _heavy_inflight > 0:
                 update_task(task_id, message="等待其他重任务结束…")
             _heavy_inflight += 1
-        _heavy_executor.submit(_run_task, task_id, True)
+        try:
+            _heavy_executor.submit(_run_task, task_id, True)
+        except Exception:
+            # submit 失败（池已 shutdown 等）必须回滚计数，否则文案永久骗人
+            with _heavy_inflight_lock:
+                _heavy_inflight = max(0, _heavy_inflight - 1)
+            raise
     else:
         _light_executor.submit(_run_task, task_id, False)
 

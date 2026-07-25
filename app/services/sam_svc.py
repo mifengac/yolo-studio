@@ -49,7 +49,8 @@ def _get_predictor():
                 "save": False,
             }
             pred = SAMPredictor(overrides=overrides)
-            pred.setup_model(model=str(path), verbose=False)
+            # model=None 时内部 get_model() 按 overrides['model'] 加载权重
+            pred.setup_model(verbose=False)
             _predictor = pred
             logger.info("MobileSAM Predictor 已加载: %s", path)
             return _predictor

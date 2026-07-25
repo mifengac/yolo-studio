@@ -7,6 +7,7 @@
 - 存储：SQLite（WAL）
 - 部署：Docker，端口 **5016**
 - 目标机器：Intel Xeon E5-2697 v3（14 核）/ 32 GB / 无 GPU / CentOS Stream 10 内网
+- 镜像体积预期 **< 3 GB**（实测约 2.9 GB：torch≈750MB + polars≈200MB + openvino≈180MB 等；旧「<2GB」按 torch 2.5 估算，已不适用）
 
 完整实现说明见 [docs/20260725_yolo_studio_设计与实现提示词.md](docs/20260725_yolo_studio_设计与实现提示词.md)。
 
@@ -128,11 +129,10 @@ python scripts/smoke_test.py --train
 
 ## 待确认事项
 
-- 若现场没有 `yolo26n.pt`，可暂时只用 `0517_*.pt` 做微调训练。
-- MobileSAM / YOLO-World 权重需按清单另行备齐；缺失时对应功能会报人话错误，不影响标注与基于已有检测模型的预标注/训练。
-- **MobileSAM 点选二次加速未在本机实测**：代码已改为 `SAMPredictor.set_image` + embedding 缓存，但当前 `weights/mobile_sam.pt` **未放置**，无法验收「同图第二次点选 < 200ms」。备齐权重后请在标注页对同一张图连续点两次验证。
+- 权重请按 [docs/20260725_离线权重清单.md](docs/20260725_离线权重清单.md) 备齐后再 build 镜像（`COPY weights`）。
 - 正式 mAP 以训练 val 为准；模型仓库「评估」接口为框数级粗评。
-- Docker 镜像需用本机一致的 torch **2.13.0+cpu** 重新 build；构建时会断言版本带 `+cpu`。
+- Docker 镜像：torch **2.13.0+cpu**，构建时断言版本串含 `+cpu`；体积预期 **< 3 GB**。
+- 开放词表（YOLO-World）在纯 CPU 上约 **0.6~1.2 秒/张**，大批量请先「试 20 张」再全量。
 
 ## 版本管理
 

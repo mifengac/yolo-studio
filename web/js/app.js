@@ -234,11 +234,13 @@ document.addEventListener("DOMContentLoaded", () => {
       },
       async runOpenvocab(d) {
         const prompts = prompt(
-          "开放词表提示词（逗号分隔）",
+          "开放词表提示词（逗号分隔）\n提示：CPU 上约 0.6~1.2 秒/张，大图集请先试 20 张",
           "motorcycle with front wheel lifted, three people on one motorcycle"
         );
         if (!prompts) return;
-        const full = confirm("点「确定」跑全量；点「取消」只试 20 张（更快）");
+        const full = confirm(
+          "点「确定」跑全量（CPU 约 0.6~1.2 秒/张，可能较久）；\n点「取消」只试 20 张（推荐先预览）"
+        );
         try {
           const body = {
             prompts: prompts.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
@@ -250,6 +252,7 @@ document.addEventListener("DOMContentLoaded", () => {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
           });
+          this.showToast(full ? "开放词表全量任务已提交（CPU 较慢）" : "开放词表试跑 20 张…");
           this.pollTask(t.id, d.id);
         } catch (e) {
           this.showToast(e.message);

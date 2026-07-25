@@ -23,15 +23,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         fonts-dejavu-core \
         curl \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 # 与本地实测一致：torch 2.13.0+cpu / torchvision 0.28.0+cpu / ultralytics 8.4.105
+# ultralytics 会拉完整 opencv-python，再卸掉只留 headless，约省 100MB+（失败则保留双份）
 RUN pip install --upgrade pip \
     && pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
-    && pip install -r /app/requirements.txt
+    && pip install -r /app/requirements.txt \
+    && pip install "git+https://github.com/ultralytics/CLIP.git" \
+    && (pip uninstall -y opencv-python || true)
 
 COPY app /app/app
 COPY web /app/web
@@ -40,6 +44,15 @@ COPY .env.example /app/.env.example
 
 # 权重在构建时可选 COPY；运行时也可用 volume 挂载
 COPY weights /app/weights
+
+# CLIP 文本塔（开放词表）；构建前请放置 weights/clip/ViT-B-32.pt（约 338MB）
+RUN mkdir -p /root/.cache/clip \
+    && if [ -f /app/weights/clip/ViT-B-32.pt ]; then \
+         cp /app/weights/clip/ViT-B-32.pt /root/.cache/clip/ViT-B-32.pt; \
+         echo "seeded CLIP ViT-B-32.pt"; \
+       else \
+         echo "WARN: weights/clip/ViT-B-32.pt 缺失，开放词表在离线环境将不可用"; \
+       fi
 
 RUN mkdir -p /root/.config/Ultralytics /app/data \
     && python - <<'PY'

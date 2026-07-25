@@ -14,3 +14,7 @@ openvino==2026.2.1
 httpx==0.28.1
 pydantic==2.13.4
 PyYAML==6.0.3
+# YOLO-World 开放词表依赖（clip 本体见 Dockerfile / run.sh 从 ultralytics/CLIP 安装）
+ftfy==6.3.1
+regex==2026.7.19
+tqdm==4.69.1

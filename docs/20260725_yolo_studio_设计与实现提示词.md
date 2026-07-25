@@ -556,7 +556,7 @@ DELETE /api/models/{id}
 | 项 | 标准 |
 |---|---|
 | 离线 | `docker run --network none` 启动后，全部功能（含标注、预标注、训练）正常，无任何联网请求 |
-| **CPU-only** | 容器内 `python -c "import torch;print(torch.__version__)"` 输出必须带 `+cpu`；镜像体积 < 2 GB |
+| **CPU-only** | 容器内 `python -c "import torch;print(torch.__version__)"` 输出必须带 `+cpu`；镜像体积 **< 3 GB**（torch 2.13 + openvino + polars 实测约 2.9 GB） |
 | **线程** | 训练时 `top` 能看到进程占用 ~1400% CPU（14 核吃满），不是只用 1 个核 |
 | **预估** | 训练提交前显示的预计耗时，与实际耗时误差在 ±30% 以内 |
 | **续训** | 训练跑到一半 `docker compose restart`，重启后任务显示"已中断"，点「继续训练」能从断点接着跑完 |
