@@ -1,0 +1,28 @@
+# 模型权重（体积大，不进仓库；按 docs/离线权重清单 手工放置）
+weights/*
+!weights/.gitkeep
+*.pt
+*.onnx
+*.engine
+
+# 运行时数据（图片、标注库、训练产物）
+data/
+!data/.gitkeep
+
+# 前端本地依赖：vue/echarts 体积小，纳入仓库以便离线 clone 即用
+# 若需排除可取消下一行注释
+# web/vendor/*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 环境配置
+.env
+
+# 日志与临时文件
+*.log
+.DS_Store
