@@ -130,7 +130,9 @@ python scripts/smoke_test.py --train
 
 - 若现场没有 `yolo26n.pt`，可暂时只用 `0517_*.pt` 做微调训练。
 - MobileSAM / YOLO-World 权重需按清单另行备齐；缺失时对应功能会报人话错误，不影响标注与基于已有检测模型的预标注/训练。
+- **MobileSAM 点选二次加速未在本机实测**：代码已改为 `SAMPredictor.set_image` + embedding 缓存，但当前 `weights/mobile_sam.pt` **未放置**，无法验收「同图第二次点选 < 200ms」。备齐权重后请在标注页对同一张图连续点两次验证。
 - 正式 mAP 以训练 val 为准；模型仓库「评估」接口为框数级粗评。
+- Docker 镜像需用本机一致的 torch **2.13.0+cpu** 重新 build；构建时会断言版本带 `+cpu`。
 
 ## 版本管理
 
