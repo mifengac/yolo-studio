@@ -2,11 +2,14 @@
 """冒烟测试：建数据集 → 导图 → 预标注 → 存标注 → 预估 → 短训 2 epoch（默认）。
 
 用法：
-  # 服务已在 5016 启动时（默认含训练）
+  # 服务已在 5016 启动时（默认含训练；结束后清理本脚本创建的数据集/模型）
   python scripts/smoke_test.py
 
   # 跳过训练
   python scripts/smoke_test.py --no-train
+
+  # 保留数据集与发布模型（调试用）
+  python scripts/smoke_test.py --keep
 """
 
 from __future__ import annotations
@@ -84,12 +87,20 @@ def main() -> int:
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="保留本脚本创建的数据集与发布模型（默认清理，避免仓库残留 smoke_*）",
+    )
     parser.add_argument("--base", default=BASE)
     args = parser.parse_args()
     base = args.base.rstrip("/")
     do_train = not args.no_train
+    keep = args.keep
 
     c = httpx.Client(base_url=base, timeout=120.0)
+    published_id = None
+    ds_id = None
     print("1) health")
     r = c.get("/api/health")
     r.raise_for_status()
@@ -236,6 +247,7 @@ def main() -> int:
         print("   best_pt", j["best_pt"])
         try:
             m = c.post(f"/api/train/{job_id}/publish", json={}).json()
+            published_id = m.get("id")
             print(
                 "   published",
                 m["id"],
@@ -249,6 +261,23 @@ def main() -> int:
             print("   publish 警告（非致命）:", exc)
     else:
         print("7) 已跳过训练（--no-train）")
+
+    if not keep:
+        print("8) 清理本脚本创建的资源")
+        if published_id:
+            try:
+                c.delete(f"/api/models/{published_id}")
+                print("   deleted model", published_id)
+            except Exception as exc:
+                print("   delete model:", exc)
+        if ds_id:
+            try:
+                c.delete(f"/api/datasets/{ds_id}")
+                print("   deleted dataset", ds_id)
+            except Exception as exc:
+                print("   delete dataset:", exc)
+    else:
+        print("8) --keep：保留数据集与模型")
 
     print("SMOKE OK")
     return 0

@@ -158,6 +158,15 @@ def next_unlabeled(dataset_id: str, after: str | None = None):
         raise HTTPException(404, str(e)) from e
 
 
+@router.post("/{dataset_id}/annotations/clear-auto")
+def clear_auto_annotations(dataset_id: str):
+    """清空模型自动预标注（source=auto），手工标注保留。"""
+    try:
+        return dataset_svc.clear_auto_annotations(dataset_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+
+
 def _parse_crop_params(params_json: str | None) -> dict:
     if not params_json:
         return CropImportParams().model_dump()

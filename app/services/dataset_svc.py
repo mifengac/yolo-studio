@@ -664,6 +664,63 @@ def confirm_image(image_id: str) -> dict:
     )
 
 
+def clear_auto_annotations(dataset_id: str) -> dict:
+    """只删 source='auto' 的预标注框，手工标注不动。
+
+    若某图删完 auto 后没有任何框，review_status 改回 unlabeled，box_count 归零；
+    若还剩 manual 框，重算 box_count，状态保留 confirmed/reviewed。
+    """
+    get_dataset(dataset_id)
+    with db._lock, db.connect() as conn:
+        auto_cnt = conn.execute(
+            """SELECT COUNT(*) AS c FROM annotation a
+               JOIN image i ON i.id=a.image_id
+               WHERE i.dataset_id=? AND a.source='auto'""",
+            (dataset_id,),
+        ).fetchone()["c"]
+        # 受影响的图片
+        img_ids = [
+            r["id"]
+            for r in conn.execute(
+                """SELECT DISTINCT i.id FROM image i
+                   JOIN annotation a ON a.image_id=i.id
+                   WHERE i.dataset_id=? AND a.source='auto'""",
+                (dataset_id,),
+            ).fetchall()
+        ]
+        conn.execute(
+            """DELETE FROM annotation WHERE source='auto' AND image_id IN (
+                 SELECT id FROM image WHERE dataset_id=?
+               )""",
+            (dataset_id,),
+        )
+        for iid in img_ids:
+            rem = conn.execute(
+                "SELECT COUNT(*) AS c FROM annotation WHERE image_id=?",
+                (iid,),
+            ).fetchone()["c"]
+            if rem == 0:
+                conn.execute(
+                    """UPDATE image SET box_count=0, review_status='unlabeled',
+                       uncertainty=0 WHERE id=?""",
+                    (iid,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE image SET box_count=? WHERE id=?",
+                    (rem, iid),
+                )
+        conn.execute(
+            "UPDATE dataset SET updated_at=? WHERE id=?",
+            (db.utcnow(), dataset_id),
+        )
+    return {
+        "dataset_id": dataset_id,
+        "deleted_auto_boxes": int(auto_cnt or 0),
+        "affected_images": len(img_ids),
+    }
+
+
 def next_unlabeled(dataset_id: str, after: Optional[str] = None) -> Optional[dict]:
     get_dataset(dataset_id)
     with db._lock, db.connect() as conn:

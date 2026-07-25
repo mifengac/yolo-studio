@@ -65,10 +65,11 @@
               <button @click="uploadZip(d)">导入 ZIP</button>
               <button @click="uploadVideo(d)">导入视频</button>
               <button class="primary" @click="openCropImport(d)">智能切图导入</button>
-              <button @click="runAutolabel(d)">模型预标注</button>
+              <button @click="openAutolabel(d)">模型预标注</button>
               <button @click="runOpenvocab(d)">开放词表</button>
               <button @click="runTrack(d)">视频跟踪传播</button>
               <button @click="runDedup(d)">近重复去重</button>
+              <button @click="clearAutoAnnotations(d)">清空预标注</button>
               <button @click="editClasses(d)">编辑类别</button>
               <button class="danger" @click="removeDataset(d)">删除</button>
             </div>
@@ -76,6 +77,39 @@
           </div>
         </div>
         <p v-if="!datasets.length" class="muted">还没有数据集，点右上角新建一个。</p>
+
+        <!-- 预标注面板 -->
+        <div v-if="alPanel.show" class="modal-mask" @click.self="alPanel.show=false">
+          <div class="modal-card" style="max-width:520px">
+            <div class="row between">
+              <h3>模型预标注 → {{ alPanel.ds && alPanel.ds.name }}</h3>
+              <button @click="alPanel.show=false">关闭</button>
+            </div>
+            <p class="hint">
+              阈值越低框越多但越不准；新训练的模型样本不足时建议 0.1~0.2。
+              类别必须和模型一致，否则会拒绝，避免写错标注。
+            </p>
+            <label>模型
+              <select v-model="alPanel.model">
+                <option value="default">默认预标注模型</option>
+                <option v-for="o in alPanel.options" :key="o.id" :value="o.path">
+                  {{ o.label }}{{ o.is_default ? ' ★默认' : '' }}
+                </option>
+              </select>
+            </label>
+            <label>置信度阈值 conf
+              <input type="number" min="0.05" max="0.9" step="0.05" v-model.number="alPanel.conf" />
+            </label>
+            <label><input type="checkbox" v-model="alPanel.overwrite" /> 覆盖已有自动标注</label>
+            <div class="row" style="margin-top:12px">
+              <button class="primary" @click="submitAutolabel">开始预标注</button>
+              <button @click="alPanel.show=false">取消</button>
+            </div>
+            <p class="muted" v-if="!alPanel.options.length" style="margin-top:8px">
+              仓库里还没有模型。请先训练并「发布到模型仓库」，再「设为默认预标注」。
+            </p>
+          </div>
+        </div>
 
         <!-- 智能切图导入面板 -->
         <div v-if="cropPanel.show" class="modal-mask" @click.self="closeCropImport">

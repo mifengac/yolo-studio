@@ -94,6 +94,14 @@ document.addEventListener("DOMContentLoaded", () => {
             preview_limit: 20,
           },
         },
+        alPanel: {
+          show: false,
+          ds: null,
+          model: "default",
+          conf: 0.15,
+          overwrite: false,
+          options: [],
+        },
       };
     },
     computed: {
@@ -238,19 +246,55 @@ document.addEventListener("DOMContentLoaded", () => {
           await new Promise((r) => setTimeout(r, 1500));
         }
       },
-      async runAutolabel(d) {
+      async openAutolabel(d) {
+        this.alPanel.show = true;
+        this.alPanel.ds = d;
+        this.alPanel.model = "default";
+        this.alPanel.conf = 0.15;
+        this.alPanel.overwrite = false;
+        this.alPanel.options = [];
+        try {
+          const r = await YS.api(`/api/datasets/${d.id}/autolabel-options`);
+          this.alPanel.options = r.options || [];
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      async submitAutolabel() {
+        const d = this.alPanel.ds;
+        if (!d) return;
         try {
           const t = await YS.api(`/api/datasets/${d.id}/autolabel`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: "default",
+              model: this.alPanel.model || "default",
               scope: "unlabeled",
-              conf: 0.25,
-              overwrite: false,
+              conf: this.alPanel.conf,
+              overwrite: !!this.alPanel.overwrite,
             }),
           });
+          this.alPanel.show = false;
           this.pollTask(t.id, d.id);
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      async clearAutoAnnotations(d) {
+        if (
+          !confirm(
+            `将删除数据集「${d.name}」中所有模型自动标注的框（source=auto），你手工标的不受影响。确定？`
+          )
+        )
+          return;
+        try {
+          const r = await YS.api(`/api/datasets/${d.id}/annotations/clear-auto`, {
+            method: "POST",
+          });
+          this.showToast(
+            `已删除 ${r.deleted_auto_boxes || 0} 个自动框，涉及 ${r.affected_images || 0} 张图`
+          );
+          await this.loadDatasets();
         } catch (e) {
           this.showToast(e.message);
         }
