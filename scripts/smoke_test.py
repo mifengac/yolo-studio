@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""冒烟测试：建数据集 → 导图 → 预标注 → 存标注 → 导出预估 →（可选）短训。
+"""冒烟测试：建数据集 → 导图 → 预标注 → 存标注 → 预估 → 短训 2 epoch（默认）。
 
 用法：
-  # 服务已在 5016 启动时
+  # 服务已在 5016 启动时（默认含训练）
   python scripts/smoke_test.py
 
-  # 含 2 epoch 训练（需 weights 下可用底模；每类框数门槛放宽为 1）
-  python scripts/smoke_test.py --train
+  # 跳过训练
+  python scripts/smoke_test.py --no-train
 """
 
 from __future__ import annotations
@@ -47,12 +47,47 @@ def wait_task(c: httpx.Client, task_id: str, timeout: float = 300.0) -> dict:
     raise TimeoutError(f"task {task_id} timeout")
 
 
+def _print_train_log_tail(job: dict, n: int = 20) -> None:
+    """训练失败时打印日志末尾，便于排查。"""
+    log_path = job.get("log_path")
+    if not log_path:
+        run_dir = job.get("run_dir")
+        if run_dir:
+            log_path = str(Path(run_dir) / "train.log")
+    if not log_path:
+        print("   (无 log_path)")
+        return
+    p = Path(log_path)
+    if not p.is_file():
+        print(f"   日志不存在: {p}")
+        return
+    try:
+        lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        print(f"   --- train.log 最后 {n} 行 ({p}) ---")
+        for line in lines[-n:]:
+            print("   |", line)
+        print("   --- end ---")
+    except Exception as exc:
+        print(f"   读日志失败: {exc}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train", action="store_true", help="跑 2 epoch 短训")
+    parser.add_argument(
+        "--no-train",
+        action="store_true",
+        help="跳过短训（默认会跑 2 epoch）",
+    )
+    # 兼容旧参数：--train 仍可写，无实际作用（默认已训）
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--base", default=BASE)
     args = parser.parse_args()
     base = args.base.rstrip("/")
+    do_train = not args.no_train
 
     c = httpx.Client(base_url=base, timeout=120.0)
     print("1) health")
@@ -100,7 +135,6 @@ def main() -> int:
     items = r.json()["items"]
     assert len(items) >= 5
     for img in items:
-        # 每类至少 1 框，方便 --train 放宽门槛
         boxes = [
             {
                 "class_idx": 0,
@@ -142,8 +176,8 @@ def main() -> int:
     )
     print("   estimate status", r.status_code, r.text[:240])
 
-    if args.train:
-        print("7) short train 2 epoch imgsz=320")
+    if do_train:
+        print("7) short train 2 epoch imgsz=320（默认执行）")
         info = c.get("/api/system/info").json()
         base_model = None
         for w in info.get("weights") or []:
@@ -161,9 +195,8 @@ def main() -> int:
                     base_model = w["name"]
                     break
         if not base_model:
-            print("   跳过训练：weights/ 下无可用检测底模")
-            print("SMOKE OK (no train)")
-            return 0
+            print("   失败：weights/ 下无可用检测底模，无法完成默认短训")
+            return 1
         r = c.post(
             "/api/train",
             json={
@@ -192,11 +225,30 @@ def main() -> int:
             if j["status"] in ("success", "failed", "canceled", "interrupted"):
                 break
             time.sleep(5)
-        assert j["status"] == "success", j
-        assert j.get("best_pt"), "missing best_pt"
+        if j["status"] != "success":
+            print("   训练失败 status=", j["status"], "error=", j.get("error") or j.get("message"))
+            _print_train_log_tail(j, 20)
+            return 1
+        if not j.get("best_pt"):
+            print("   训练结束但缺少 best_pt")
+            _print_train_log_tail(j, 20)
+            return 1
         print("   best_pt", j["best_pt"])
-        m = c.post(f"/api/train/{job_id}/publish", json={}).json()
-        print("   published", m["id"], "openvino", m.get("openvino_path"), "(异步导出可能稍后才有)")
+        try:
+            m = c.post(f"/api/train/{job_id}/publish", json={}).json()
+            print(
+                "   published",
+                m["id"],
+                "openvino",
+                m.get("openvino_path"),
+                "ov_status",
+                m.get("ov_status"),
+                "(异步导出可能稍后才 ready)",
+            )
+        except Exception as exc:
+            print("   publish 警告（非致命）:", exc)
+    else:
+        print("7) 已跳过训练（--no-train）")
 
     print("SMOKE OK")
     return 0

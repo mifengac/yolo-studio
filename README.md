@@ -7,7 +7,7 @@
 - 存储：SQLite（WAL）
 - 部署：Docker，端口 **5016**
 - 目标机器：Intel Xeon E5-2697 v3（14 核）/ 32 GB / 无 GPU / CentOS Stream 10 内网
-- 镜像体积预期 **< 3 GB**（实测约 2.9 GB：torch≈750MB + polars≈200MB + openvino≈180MB 等；旧「<2GB」按 torch 2.5 估算，已不适用）
+- 镜像体积：含 CLIP 后实测约 **4.5 GB**（torch≈750MB + CLIP 权重 338MB + openvino≈180MB + polars≈200MB + 检测/SAM 权重等）；预期 **< 5 GB**
 
 完整实现说明见 [docs/20260725_yolo_studio_设计与实现提示词.md](docs/20260725_yolo_studio_设计与实现提示词.md)。
 
@@ -101,11 +101,11 @@ docker exec -it $(docker ps -qf ancestor=yolo-studio) \
 ## 冒烟测试
 
 ```bash
-# 服务启动后
+# 服务启动后（默认含 2 epoch 短训，需 weights 底模）
 pip install httpx pillow
 python scripts/smoke_test.py
-# 含短训（需底模权重）
-python scripts/smoke_test.py --train
+# 只测接口、跳过训练
+python scripts/smoke_test.py --no-train
 ```
 
 ## 标注快捷键
