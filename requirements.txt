@@ -1,13 +1,16 @@
+# 版本以本机 .venv 实测（冒烟通过）为准；离线交付必须可复现
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu
-torchvision==0.20.1+cpu
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-python-dotenv>=1.0.0
-python-multipart>=0.0.12
-Pillow>=10.0.0
-numpy>=1.26.0
-ultralytics>=8.3.0
-opencv-python-headless>=4.10.0
-openvino>=2024.0.0
-httpx>=0.27.0
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
+fastapi==0.140.0
+uvicorn[standard]==0.51.0
+python-dotenv==1.2.2
+python-multipart==0.0.32
+Pillow==12.2.0
+numpy==2.4.4
+ultralytics==8.4.105
+opencv-python-headless==5.0.0.93
+openvino==2026.2.1
+httpx==0.28.1
+pydantic==2.13.4
+PyYAML==6.0.3

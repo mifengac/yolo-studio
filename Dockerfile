@@ -28,8 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
+# 与本地实测一致：torch 2.13.0+cpu / torchvision 0.28.0+cpu / ultralytics 8.4.105
 RUN pip install --upgrade pip \
-    && pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r /app/requirements.txt
 
 COPY app /app/app
@@ -73,7 +74,8 @@ SETTINGS.update({
 print("ultralytics settings updated, torch check next")
 import torch
 print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-assert "+cpu" in torch.__version__ or not torch.cuda.is_available()
+# 必须是 CPU 版；禁止用「无 CUDA 就放过」——CUDA wheel 在无 GPU 机器上 is_available 也是 False
+assert "+cpu" in torch.__version__, f"必须是 CPU 版 torch，实际: {torch.__version__}"
 print("ok")
 PY
 
