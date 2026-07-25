@@ -140,7 +140,33 @@ def init_db() -> None:
                 "pid": "INTEGER",
             },
         )
-        _ensure_columns(conn, "model", {"openvino_path": "TEXT"})
+        _ensure_columns(
+            conn,
+            "model",
+            {
+                "openvino_path": "TEXT",
+                # pending | exporting | ready | failed；旧数据 NULL 按 openvino_path 兼容
+                "ov_status": "TEXT",
+            },
+        )
+        # 旧记录兼容：有 openvino_path 视为 ready，否则 pending
+        conn.execute(
+            """UPDATE model SET ov_status='ready'
+               WHERE openvino_path IS NOT NULL AND openvino_path != ''
+                 AND (ov_status IS NULL OR ov_status='')"""
+        )
+        conn.execute(
+            """UPDATE model SET ov_status='pending'
+               WHERE (openvino_path IS NULL OR openvino_path='')
+                 AND (ov_status IS NULL OR ov_status='')"""
+        )
+        # 去重算法从 aHash 换 pHash，旧值不兼容，清空让任务重算
+        try:
+            conn.execute(
+                "UPDATE image SET phash=NULL WHERE phash IS NOT NULL AND phash NOT LIKE 'p1:%'"
+            )
+        except Exception:
+            pass
 
 
 def _ensure_columns(conn: sqlite3.Connection, table: str, cols: dict[str, str]) -> None:

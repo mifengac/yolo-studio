@@ -21,6 +21,18 @@ def _new_id() -> str:
     return f"mdl_{time.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
 
 
+def _normalize_ov_status(d: dict) -> dict:
+    """旧数据兼容：有路径当 ready，否则 pending。"""
+    st = d.get("ov_status")
+    if st in ("pending", "exporting", "ready", "failed"):
+        return d
+    if d.get("openvino_path"):
+        d["ov_status"] = "ready"
+    else:
+        d["ov_status"] = "pending"
+    return d
+
+
 def list_models() -> list[dict]:
     with db._lock, db.connect() as conn:
         rows = conn.execute(
@@ -32,7 +44,7 @@ def list_models() -> list[dict]:
         d["classes"] = db.loads_json(d.get("classes"), [])
         d["metrics"] = db.loads_json(d.get("metrics"), {})
         d["is_default_autolabel"] = bool(d.get("is_default_autolabel"))
-        out.append(d)
+        out.append(_normalize_ov_status(d))
     return out
 
 
@@ -45,7 +57,7 @@ def get_model(model_id: str) -> dict:
     d["classes"] = db.loads_json(d.get("classes"), [])
     d["metrics"] = db.loads_json(d.get("metrics"), {})
     d["is_default_autolabel"] = bool(d.get("is_default_autolabel"))
-    return d
+    return _normalize_ov_status(d)
 
 
 def get_default_autolabel_path() -> Optional[str]:
@@ -87,16 +99,18 @@ def register_model(
     config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest)
     ov_path = None
+    ov_status = "pending"
     if export_ov:
         ov_path = _do_export_openvino(mid, dest, imgsz=imgsz)
+        ov_status = "ready" if ov_path else "failed"
 
     now = db.utcnow()
     with db._lock, db.connect() as conn:
         conn.execute(
             """INSERT INTO model
                (id, name, path, classes, metrics, from_job, notes,
-                is_default_autolabel, openvino_path, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                is_default_autolabel, openvino_path, ov_status, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 mid,
                 name,
@@ -107,10 +121,11 @@ def register_model(
                 notes,
                 0,
                 ov_path,
+                ov_status,
                 now,
             ),
         )
-    if schedule_openvino and not ov_path:
+    if schedule_openvino and ov_status == "pending":
         try:
             from app import tasks as task_mod
 
@@ -121,6 +136,11 @@ def register_model(
             )
         except Exception as exc:
             logger.warning("提交 OpenVINO 导出任务失败（模型仍可用）: %s", exc)
+            with db._lock, db.connect() as conn:
+                conn.execute(
+                    "UPDATE model SET ov_status='failed', notes=? WHERE id=?",
+                    ((notes or "") + f"\nOpenVINO 任务提交失败: {exc}", mid),
+                )
     return get_model(mid)
 
 
@@ -150,21 +170,46 @@ def run_openvino_export(task: dict) -> None:
     if not model_id:
         raise ValueError("缺少 model_id")
     m = get_model(model_id)
+    with db._lock, db.connect() as conn:
+        conn.execute("UPDATE model SET ov_status='exporting' WHERE id=?", (model_id,))
     task_mod.set_progress(task_id, 10, f"正在导出 OpenVINO：{m['name']}")
     ov_path = _do_export_openvino(model_id, Path(m["path"]), imgsz=imgsz)
     if ov_path:
         with db._lock, db.connect() as conn:
             conn.execute(
-                "UPDATE model SET openvino_path=? WHERE id=?",
+                "UPDATE model SET openvino_path=?, ov_status='ready' WHERE id=?",
                 (ov_path, model_id),
             )
         task_mod.set_progress(task_id, 100, f"OpenVINO 导出完成：{ov_path}")
     else:
+        with db._lock, db.connect() as conn:
+            conn.execute(
+                """UPDATE model SET ov_status='failed',
+                   notes=COALESCE(notes,'') || ? WHERE id=?""",
+                ("\nOpenVINO 导出失败，继续用 .pt", model_id),
+            )
         task_mod.update_task(
             task_id,
             message="OpenVINO 导出失败，继续使用 .pt 推理",
         )
         logger.warning("模型 %s OpenVINO 导出失败，已降级为 .pt", model_id)
+
+
+def prefer_openvino_for_path(pt_path: str | Path) -> bool:
+    """仅当注册模型 ov_status=ready（或未注册但目录存在）时优先 OpenVINO。"""
+    pt = Path(pt_path).resolve()
+    with db._lock, db.connect() as conn:
+        row = conn.execute(
+            "SELECT ov_status, openvino_path FROM model WHERE path=?",
+            (str(pt),),
+        ).fetchone()
+    if row:
+        st = row["ov_status"]
+        if st is None or st == "":
+            return bool(row["openvino_path"])
+        return st == "ready"
+    # 未注册的预置权重：有导出目录就用
+    return True
 
 
 def set_default_autolabel(model_id: str) -> dict:
@@ -217,8 +262,9 @@ def evaluate_model(model_id: str, dataset_id: str, conf: float = 0.25, imgsz: in
         path = dataset_svc.image_file_path(it)
         if not path.is_file():
             continue
+        prefer_ov = prefer_openvino_for_path(m["path"]) and m.get("ov_status") == "ready"
         preds = engine.predict_boxes_batch(
-            m["path"], [str(path)], conf=conf, imgsz=imgsz, prefer_openvino=True
+            m["path"], [str(path)], conf=conf, imgsz=imgsz, prefer_openvino=prefer_ov
         )[0]
         mapped = []
         for b in preds:

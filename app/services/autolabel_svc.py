@@ -161,13 +161,16 @@ def run_autolabel(task: dict) -> None:
                 valid.append(it)
         if not paths:
             continue
+        from app.services import model_svc as _ms
+
+        prefer_ov = _ms.prefer_openvino_for_path(model_path)
         results = engine.predict_boxes_batch(
             model_path,
             paths,
             conf=conf,
             iou=iou,
             imgsz=imgsz,
-            prefer_openvino=True,
+            prefer_openvino=prefer_ov,
         )
         for it, boxes in zip(valid, results):
             mapped = []

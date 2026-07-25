@@ -181,8 +181,10 @@
             <div>
               <strong>{{ m.name }}</strong>
               <span class="pill" v-if="m.is_default_autolabel">默认预标注</span>
-              <span class="pill" v-if="m.openvino_path">OpenVINO</span>
-              <span class="muted" v-else>OpenVINO 未就绪 / 导出中</span>
+              <span class="pill" v-if="m.ov_status==='ready' || m.openvino_path">OpenVINO 就绪</span>
+              <span class="muted" v-else-if="m.ov_status==='exporting' || m.ov_status==='pending'">加速版本准备中…</span>
+              <span class="muted" v-else-if="m.ov_status==='failed'">加速版本导出失败，正在用普通模式（不影响使用）</span>
+              <span class="muted" v-else>OpenVINO 未就绪</span>
               <div class="muted">{{ m.id }} · {{ m.path }}</div>
               <div class="tags"><span class="tag" v-for="c in m.classes" :key="c">{{ c }}</span></div>
               <div class="muted" v-if="m.metrics && (m.metrics.mAP50 != null)">
