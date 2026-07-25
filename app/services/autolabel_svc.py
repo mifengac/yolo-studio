@@ -202,7 +202,7 @@ def run_autolabel(task: dict) -> None:
         task_mod.set_progress(task_id, 100, "没有需要预标注的图片")
         return
 
-    # OpenVINO：非动态形状时强制对齐导出 imgsz 与 batch=1
+    # OpenVINO：非动态形状时强制对齐导出 imgsz 与 batch=1（旧模型靠 metadata 回填）
     prefer_ov = _ms.prefer_openvino_for_path(model_path)
     export_meta = _ms.get_export_meta_for_path(model_path)
     batch = config.INFER_BATCH_SIZE
@@ -221,6 +221,7 @@ def run_autolabel(task: dict) -> None:
         task_mod.update_task(task_id, message="；".join(align_notes))
 
     labeled = 0
+    # 本任务内一旦 OpenVINO 失败，后续批次一律 .pt，避免每批白试一次
     used_pt_fallback = False
     for i in range(0, total, batch):
         part = items[i : i + batch]
@@ -233,6 +234,7 @@ def run_autolabel(task: dict) -> None:
                 valid.append(it)
         if not paths:
             continue
+        use_ov = prefer_ov and not used_pt_fallback
         try:
             results = engine.predict_boxes_batch(
                 model_path,
@@ -240,15 +242,15 @@ def run_autolabel(task: dict) -> None:
                 conf=conf,
                 iou=iou,
                 imgsz=imgsz,
-                prefer_openvino=prefer_ov and not used_pt_fallback,
+                prefer_openvino=use_ov,
             )
         except Exception as exc:
-            if prefer_ov and not used_pt_fallback:
+            if use_ov:
                 logger.warning("OpenVINO 推理失败，降级用 .pt：%s", exc)
                 used_pt_fallback = True
                 task_mod.update_task(
                     task_id,
-                    message="OpenVINO 不兼容，已自动改用 .pt 继续",
+                    message="OpenVINO 不兼容，已自动改用 .pt 继续（速度较慢）",
                 )
                 results = engine.predict_boxes_batch(
                     model_path,
@@ -290,12 +292,19 @@ def run_autolabel(task: dict) -> None:
         pct = 100.0 * min(i + batch, total) / total
         msg = f"预标注进度 {min(i + batch, total)}/{total}"
         if used_pt_fallback:
-            msg += "（.pt）"
+            msg += "（.pt 降级）"
         task_mod.set_progress(task_id, pct, msg)
 
-    tail = f"完成：处理 {labeled} 张，模型 {Path(model_path).name}"
+    # 直接标 success，避免任务框架用默认「完成」盖掉总结（含降级说明）
+    parts = [f"完成：处理 {labeled} 张，模型 {Path(model_path).name}"]
     if used_pt_fallback:
-        tail += "；本次 OpenVINO 已降级为 .pt"
+        parts.append("OpenVINO 不兼容，已自动改用 .pt 继续（速度较慢）")
     if align_notes:
-        tail += "；" + "；".join(align_notes)
-    task_mod.update_task(task_id, message=tail)
+        parts.extend(align_notes)
+    task_mod.update_task(
+        task_id,
+        status="success",
+        progress=100,
+        message="；".join(parts),
+        finished_at=db.utcnow(),
+    )

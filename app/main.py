@@ -52,6 +52,15 @@ async def lifespan(app: FastAPI):
     n = train_svc.recover_interrupted_jobs()
     if n:
         logger.warning("启动恢复：标记 %s 个中断的训练任务", n)
+    # 旧模型：从 OpenVINO metadata.yaml 回填 export_imgsz / export_dynamic
+    try:
+        from app.services import model_svc as _model_svc
+
+        nb = _model_svc.backfill_export_meta_from_disk()
+        if nb:
+            logger.info("已回填 %s 条模型的 OpenVINO 导出元数据", nb)
+    except Exception as exc:
+        logger.warning("回填 OpenVINO 元数据失败: %s", exc)
     # 尝试关闭 ultralytics 同步
     try:
         from ultralytics.utils import SETTINGS

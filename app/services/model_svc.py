@@ -221,22 +221,103 @@ def prefer_openvino_for_path(pt_path: str | Path) -> bool:
     return engine._find_openvino_dir(pt) is not None
 
 
+def _parse_ov_metadata(ov_dir: str | Path) -> dict:
+    """从 OpenVINO 导出目录的 metadata.yaml 读取 imgsz / dynamic。"""
+    meta_path = Path(ov_dir) / "metadata.yaml"
+    out: dict = {"export_imgsz": None, "export_dynamic": False}
+    if not meta_path.is_file():
+        return out
+    try:
+        import yaml
+
+        data = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
+        imgsz = data.get("imgsz")
+        if isinstance(imgsz, (list, tuple)) and imgsz:
+            out["export_imgsz"] = int(imgsz[0])
+        elif isinstance(imgsz, int):
+            out["export_imgsz"] = imgsz
+        args = data.get("args") or {}
+        dyn = args.get("dynamic", data.get("dynamic", False))
+        out["export_dynamic"] = bool(dyn)
+    except Exception as exc:
+        logger.warning("读 OpenVINO metadata 失败 %s: %s", meta_path, exc)
+    return out
+
+
 def get_export_meta_for_path(pt_path: str | Path) -> Optional[dict]:
-    """返回注册模型的 export_imgsz / export_dynamic；未注册返回 None。"""
+    """返回注册模型的 export_imgsz / export_dynamic；未注册返回 None。
+
+    若库内为空但磁盘有 OpenVINO 目录，会从 metadata.yaml 现读（并尽量回写库）。
+    """
     pt = Path(pt_path).resolve()
     with db._lock, db.connect() as conn:
         row = conn.execute(
-            "SELECT export_imgsz, export_dynamic, openvino_path, ov_status FROM model WHERE path=?",
+            """SELECT id, export_imgsz, export_dynamic, openvino_path, ov_status
+               FROM model WHERE path=?""",
             (str(pt),),
         ).fetchone()
     if not row:
         return None
-    return {
+    d = {
         "export_imgsz": row["export_imgsz"],
-        "export_dynamic": bool(row["export_dynamic"]) if row["export_dynamic"] is not None else False,
+        "export_dynamic": bool(row["export_dynamic"])
+        if row["export_dynamic"] is not None
+        else False,
         "openvino_path": row["openvino_path"],
         "ov_status": row["ov_status"],
     }
+    # 旧记录 NULL：从磁盘 metadata 补全
+    if d["export_imgsz"] is None and d.get("openvino_path"):
+        parsed = _parse_ov_metadata(d["openvino_path"])
+        if parsed.get("export_imgsz"):
+            d["export_imgsz"] = parsed["export_imgsz"]
+            d["export_dynamic"] = parsed.get("export_dynamic", False)
+            try:
+                with db._lock, db.connect() as conn:
+                    conn.execute(
+                        """UPDATE model SET export_imgsz=?, export_dynamic=?
+                           WHERE id=? AND (export_imgsz IS NULL OR export_imgsz='')""",
+                        (
+                            d["export_imgsz"],
+                            1 if d["export_dynamic"] else 0,
+                            row["id"],
+                        ),
+                    )
+            except Exception:
+                pass
+    return d
+
+
+def backfill_export_meta_from_disk() -> int:
+    """启动时：给 openvino 已 ready 但 export_imgsz 为空的旧模型回填元数据。"""
+    with db._lock, db.connect() as conn:
+        rows = conn.execute(
+            """SELECT id, openvino_path FROM model
+               WHERE openvino_path IS NOT NULL AND openvino_path != ''
+                 AND (export_imgsz IS NULL)"""
+        ).fetchall()
+    n = 0
+    for r in rows:
+        parsed = _parse_ov_metadata(r["openvino_path"])
+        if not parsed.get("export_imgsz"):
+            continue
+        with db._lock, db.connect() as conn:
+            conn.execute(
+                """UPDATE model SET export_imgsz=?, export_dynamic=? WHERE id=?""",
+                (
+                    int(parsed["export_imgsz"]),
+                    1 if parsed.get("export_dynamic") else 0,
+                    r["id"],
+                ),
+            )
+        n += 1
+        logger.info(
+            "回填模型 %s export_imgsz=%s dynamic=%s",
+            r["id"],
+            parsed["export_imgsz"],
+            parsed.get("export_dynamic"),
+        )
+    return n
 
 
 def set_default_autolabel(model_id: str) -> dict:
