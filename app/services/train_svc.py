@@ -438,11 +438,13 @@ def _execute_training(job: dict, *, resume: bool) -> None:
     t0 = time.time()
     while True:
         ret = proc.poll()
-        # 解析 epoch
+        # 解析 epoch：只认「当前轮/总轮数」，排除 batch 进度条（如 1/1、3/10）
         try:
             text = log_path.read_text(encoding="utf-8", errors="ignore")[-8000:]
             for m in _EPOCH_RE.finditer(text):
-                last_epoch = max(last_epoch, int(m.group(1)))
+                cur, total = int(m.group(1)), int(m.group(2))
+                if total == epochs and 0 <= cur <= epochs:
+                    last_epoch = max(last_epoch, cur)
         except Exception:
             pass
         if last_epoch > 0:

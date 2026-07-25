@@ -1,0 +1,13 @@
+# 构建上下文瘦身
+.git
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+data/
+docs/
+*.md
+.env
+
+# CLIP 权重单独 COPY 到 /root/.cache/clip，避免与 weights/ 双份各占一层 338MB
+weights/clip/

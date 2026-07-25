@@ -44,17 +44,11 @@ COPY web /app/web
 COPY scripts /app/scripts
 COPY .env.example /app/.env.example
 
-# 权重在构建时可选 COPY；运行时也可用 volume 挂载
+# 检测/SAM 权重（.dockerignore 已排除 weights/clip/，避免 CLIP 双份占层）
 COPY weights /app/weights
 
-# CLIP 文本塔（开放词表）；构建前请放置 weights/clip/ViT-B-32.pt（约 338MB）
-RUN mkdir -p /root/.cache/clip \
-    && if [ -f /app/weights/clip/ViT-B-32.pt ]; then \
-         cp /app/weights/clip/ViT-B-32.pt /root/.cache/clip/ViT-B-32.pt; \
-         echo "seeded CLIP ViT-B-32.pt"; \
-       else \
-         echo "WARN: weights/clip/ViT-B-32.pt 缺失，开放词表在离线环境将不可用"; \
-       fi
+# CLIP 文本塔只放一份到运行时查找路径（构建前准备 weights/clip/ViT-B-32.pt）
+COPY weights/clip/ViT-B-32.pt /root/.cache/clip/ViT-B-32.pt
 
 RUN mkdir -p /root/.config/Ultralytics /app/data \
     && python - <<'PY'
