@@ -7,7 +7,7 @@
 - 存储：SQLite（WAL）
 - 部署：Docker，端口 **5016**
 - 目标机器：Intel Xeon E5-2697 v3（14 核）/ 32 GB / 无 GPU / CentOS Stream 10 内网
-- 镜像体积：多阶段去 CLIP 双份后实测 **3.77GB**（此前双份约 4.45GB；CLIP 只在 ）。硬成本 torch+openvino+polars+CLIP 一份+检测权重。 拷内网请按 **≥ 4.5 GB** 准备
+- 镜像体积：多阶段去 CLIP 双份后实测 **3.77 GB**（此前双份约 4.45 GB；CLIP 只在 `/root/.cache/clip/`）。硬成本含 torch、openvino、polars、CLIP 一份与检测权重。`docker save` 拷内网请按 **≥ 4 GB** 准备
 
 完整实现说明见 [docs/20260725_yolo_studio_设计与实现提示词.md](docs/20260725_yolo_studio_设计与实现提示词.md)。
 
