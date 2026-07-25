@@ -81,7 +81,8 @@ class TrainEstimateRequest(BaseModel):
 class TrainCreateRequest(BaseModel):
     dataset_id: str
     base_model: str = "weights/yolo26n.pt"
-    epochs: int = 40
+    # None = 后端按微调/从零自动：微调 20、从零 40（curl/冒烟不传时生效）
+    epochs: Optional[int] = None
     imgsz: int = 416
     batch: int = 16
     val_ratio: float = 0.2
