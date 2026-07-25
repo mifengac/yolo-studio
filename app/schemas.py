@@ -37,7 +37,7 @@ class AnnotationsPut(BaseModel):
 class AutolabelRequest(BaseModel):
     # "default"/"auto" 时走模型仓库默认预标注路径，闭环才能生效
     model: str = "default"
-    conf: float = 0.25
+    conf: float = 0.15  # 新模型样本少时 0.25 几乎检不出，默认放宽
     iou: float = 0.5
     imgsz: int = 640
     class_map: dict[str, int] = Field(default_factory=dict)

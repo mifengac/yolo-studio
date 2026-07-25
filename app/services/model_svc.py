@@ -61,20 +61,16 @@ def get_model(model_id: str) -> dict:
 
 
 def get_default_autolabel_path() -> Optional[str]:
+    """仅返回模型仓库里显式设为默认的路径；不再回退 0517 等业务权重。
+
+    错误兜底会把翘车头模型套到头盔等新场景上，静默污染标注，危害大于无模型。
+    """
     with db._lock, db.connect() as conn:
         row = conn.execute(
             "SELECT path FROM model WHERE is_default_autolabel=1 LIMIT 1"
         ).fetchone()
     if row:
         return row["path"]
-    # 回退预置
-    for key in (
-        "0517_yolo26s_wheelie_multi-rider.pt",
-        "0517_yolo26n_wheelie_multi-rider.pt",
-    ):
-        p = config.WEIGHTS_DIR / key
-        if p.is_file():
-            return str(p)
     return None
 
 
@@ -100,8 +96,9 @@ def register_model(
     shutil.copy2(src, dest)
     ov_path = None
     ov_status = "pending"
+    export_dynamic = 1
     if export_ov:
-        ov_path = _do_export_openvino(mid, dest, imgsz=imgsz)
+        ov_path = _do_export_openvino(mid, dest, imgsz=imgsz, dynamic=True)
         ov_status = "ready" if ov_path else "failed"
 
     now = db.utcnow()
@@ -109,8 +106,9 @@ def register_model(
         conn.execute(
             """INSERT INTO model
                (id, name, path, classes, metrics, from_job, notes,
-                is_default_autolabel, openvino_path, ov_status, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                is_default_autolabel, openvino_path, ov_status,
+                export_imgsz, export_dynamic, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 mid,
                 name,
@@ -122,6 +120,8 @@ def register_model(
                 0,
                 ov_path,
                 ov_status,
+                imgsz if ov_path or schedule_openvino else None,
+                export_dynamic if ov_path or schedule_openvino else None,
                 now,
             ),
         )
@@ -131,7 +131,7 @@ def register_model(
 
             task_mod.create_task(
                 "openvino_export",
-                {"model_id": mid, "imgsz": imgsz},
+                {"model_id": mid, "imgsz": imgsz, "dynamic": True},
                 submit=True,
             )
         except Exception as exc:
@@ -144,8 +144,10 @@ def register_model(
     return get_model(mid)
 
 
-def _do_export_openvino(model_id: str, pt_path: Path, imgsz: int = 416) -> Optional[str]:
-    ov = engine.export_openvino(pt_path, imgsz=imgsz)
+def _do_export_openvino(
+    model_id: str, pt_path: Path, imgsz: int = 416, *, dynamic: bool = True
+) -> Optional[str]:
+    ov = engine.export_openvino(pt_path, imgsz=imgsz, dynamic=dynamic)
     if not ov:
         return None
     target = config.MODELS_DIR / f"{model_id}_openvino_model"
@@ -166,19 +168,26 @@ def run_openvino_export(task: dict) -> None:
     params = task.get("params") or {}
     model_id = params.get("model_id")
     imgsz = int(params.get("imgsz", 416))
+    dynamic = bool(params.get("dynamic", True))
     task_id = task["id"]
     if not model_id:
         raise ValueError("缺少 model_id")
     m = get_model(model_id)
     with db._lock, db.connect() as conn:
-        conn.execute("UPDATE model SET ov_status='exporting' WHERE id=?", (model_id,))
-    task_mod.set_progress(task_id, 10, f"正在导出 OpenVINO：{m['name']}")
-    ov_path = _do_export_openvino(model_id, Path(m["path"]), imgsz=imgsz)
+        conn.execute(
+            "UPDATE model SET ov_status='exporting', export_imgsz=?, export_dynamic=? WHERE id=?",
+            (imgsz, 1 if dynamic else 0, model_id),
+        )
+    task_mod.set_progress(task_id, 10, f"正在导出 OpenVINO：{m['name']}（dynamic={dynamic}）")
+    ov_path = _do_export_openvino(
+        model_id, Path(m["path"]), imgsz=imgsz, dynamic=dynamic
+    )
     if ov_path:
         with db._lock, db.connect() as conn:
             conn.execute(
-                "UPDATE model SET openvino_path=?, ov_status='ready' WHERE id=?",
-                (ov_path, model_id),
+                """UPDATE model SET openvino_path=?, ov_status='ready',
+                   export_imgsz=?, export_dynamic=? WHERE id=?""",
+                (ov_path, imgsz, 1 if dynamic else 0, model_id),
             )
         task_mod.set_progress(task_id, 100, f"OpenVINO 导出完成：{ov_path}")
     else:
@@ -208,8 +217,26 @@ def prefer_openvino_for_path(pt_path: str | Path) -> bool:
         if st is None or st == "":
             return bool(row["openvino_path"])
         return st == "ready"
-    # 未注册的预置权重：有导出目录就用
-    return True
+    # 未注册的预置权重：有导出目录才用
+    return engine._find_openvino_dir(pt) is not None
+
+
+def get_export_meta_for_path(pt_path: str | Path) -> Optional[dict]:
+    """返回注册模型的 export_imgsz / export_dynamic；未注册返回 None。"""
+    pt = Path(pt_path).resolve()
+    with db._lock, db.connect() as conn:
+        row = conn.execute(
+            "SELECT export_imgsz, export_dynamic, openvino_path, ov_status FROM model WHERE path=?",
+            (str(pt),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "export_imgsz": row["export_imgsz"],
+        "export_dynamic": bool(row["export_dynamic"]) if row["export_dynamic"] is not None else False,
+        "openvino_path": row["openvino_path"],
+        "ov_status": row["ov_status"],
+    }
 
 
 def set_default_autolabel(model_id: str) -> dict:
@@ -223,6 +250,7 @@ def set_default_autolabel(model_id: str) -> dict:
 
 
 def delete_model(model_id: str) -> None:
+    """删库记录并清理 .pt 与 OpenVINO 目录，不留孤儿文件。"""
     m = get_model(model_id)
     with db._lock, db.connect() as conn:
         conn.execute("DELETE FROM model WHERE id=?", (model_id,))
@@ -232,6 +260,15 @@ def delete_model(model_id: str) -> None:
     ov = m.get("openvino_path")
     if ov and Path(ov).is_dir():
         shutil.rmtree(ov, ignore_errors=True)
+    # 规范目录名也可能存在（openvino_path 为空时）
+    stem_ov = config.MODELS_DIR / f"{model_id}_openvino_model"
+    if stem_ov.is_dir():
+        shutil.rmtree(stem_ov, ignore_errors=True)
+    # 按文件 stem 的导出目录
+    if p.stem:
+        alt = config.MODELS_DIR / f"{p.stem}_openvino_model"
+        if alt.is_dir():
+            shutil.rmtree(alt, ignore_errors=True)
 
 
 def evaluate_model(model_id: str, dataset_id: str, conf: float = 0.25, imgsz: int = 416) -> dict:
