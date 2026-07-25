@@ -316,9 +316,27 @@ def append_log(log_path: str | Path, msg: str) -> None:
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 
+def _resolve_yolo_bin() -> str:
+    """定位 ultralytics 的 yolo 可执行文件（本地 venv 与容器均可）。
+
+    注意：ultralytics 8.4 没有 __main__.py，不能用 `python -m ultralytics`。
+    """
+    import shutil
+
+    cand = Path(sys.executable).parent / "yolo"
+    if cand.is_file():
+        return str(cand)
+    found = shutil.which("yolo")
+    if found:
+        return found
+    raise FileNotFoundError(
+        "未找到 ultralytics 的 yolo 命令，请确认 ultralytics 已正确安装"
+    )
+
+
 def _resolve_yolo_cmd() -> list[str]:
-    """跨平台：用当前解释器 -m ultralytics。"""
-    return [sys.executable, "-m", "ultralytics"]
+    """训练/续训共用：返回 [yolo_bin]。"""
+    return [_resolve_yolo_bin()]
 
 
 def run_train_job(task: dict) -> None:
@@ -609,8 +627,14 @@ def _is_our_train_process(pid: int, job: dict) -> bool:
             run_dir = str(Path(job["run_dir"]).resolve())
         except Exception:
             run_dir = str(job["run_dir"])
-    # 训练命令含 -m ultralytics detect train；project/name 分别带 RUNS_DIR 与 job_id
-    has_yolo = "ultralytics" in cmdline or ("detect" in cmdline and "train" in cmdline)
+    # 训练走 yolo CLI（或旧版 -m ultralytics）；cmdline 含 detect train + job_id
+    has_yolo = (
+        "ultralytics" in cmdline
+        or "/yolo " in f" {cmdline} "
+        or cmdline.strip().endswith("yolo")
+        or " yolo " in f" {cmdline} "
+        or ("detect" in cmdline and "train" in cmdline)
+    )
     has_job = bool(job_id) and job_id in cmdline
     has_run = bool(run_dir) and run_dir in cmdline
     return has_yolo and (has_job or has_run)
