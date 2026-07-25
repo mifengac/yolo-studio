@@ -64,7 +64,23 @@ DEFAULT_IOU = 0.5
 # 开放词表 / SAM 限制
 OPENVOCAB_MAX_IMAGES = 200
 TRACK_MAX_FRAMES = 300
-SAM_EMBED_CACHE_SIZE = 8
+# SAM image embedding 缓存条数（每条约数十～上百 MB，CPU 上建议 ≤4）
+SAM_EMBED_CACHE_SIZE = 4
+
+# 重 CPU 任务类型（走 heavy 线程池，串行；轻任务走 light 池不阻塞界面）
+HEAVY_TASK_TYPES = frozenset(
+    {
+        "autolabel",
+        "openvocab",
+        "track",
+        "train",
+        "train_resume",
+        "export",
+        "evaluate",
+        "openvino_export",
+        "import_video",
+    }
+)
 
 # 耗时预估基线：E5-2697 v3，1000 张，yolo26n，imgsz=640，不冻结 = 10 分钟/epoch
 ESTIMATE_BASE_SEC_PER_EPOCH = 600.0

@@ -1,9 +1,8 @@
-"""通用后台任务队列：线程池 + task 表。训练与重 CPU 任务互斥排队。"""
+"""通用后台任务队列：重任务 / 轻任务分池，训练与预标注等串行不堵界面。"""
 
 from __future__ import annotations
 
 import logging
-import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -14,10 +13,13 @@ from app import config, db
 
 logger = logging.getLogger(__name__)
 
-_executor: Optional[ThreadPoolExecutor] = None
-_heavy_lock = threading.Lock()  # 训练/预标注/跟踪互斥
+_heavy_executor: Optional[ThreadPoolExecutor] = None
+_light_executor: Optional[ThreadPoolExecutor] = None
 _handlers: dict[str, Callable[[dict], None]] = {}
 _started = False
+# 重任务池内已排队/运行数（用于「等待其他重任务」文案；池 max_workers=1 保证串行）
+_heavy_inflight = 0
+_heavy_inflight_lock = __import__("threading").Lock()
 
 
 def new_task_id(prefix: str = "task") -> str:
@@ -28,20 +30,29 @@ def register_handler(task_type: str, fn: Callable[[dict], None]) -> None:
     _handlers[task_type] = fn
 
 
+def _is_heavy(task_type: str) -> bool:
+    return (task_type or "") in config.HEAVY_TASK_TYPES
+
+
 def start_workers() -> None:
-    global _executor, _started
+    global _heavy_executor, _light_executor, _started
     if _started:
         return
-    _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ys-worker")
+    # 重任务单 worker 串行，不再用全局锁占满名额
+    _heavy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ys-heavy")
+    _light_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ys-light")
     _started = True
-    logger.info("后台任务线程池已启动")
+    logger.info("后台任务线程池已启动（heavy=1, light=4）")
 
 
 def stop_workers() -> None:
-    global _executor, _started
-    if _executor:
-        _executor.shutdown(wait=False, cancel_futures=True)
-        _executor = None
+    global _heavy_executor, _light_executor, _started
+    if _heavy_executor:
+        _heavy_executor.shutdown(wait=False, cancel_futures=True)
+        _heavy_executor = None
+    if _light_executor:
+        _light_executor.shutdown(wait=False, cancel_futures=True)
+        _light_executor = None
     _started = False
 
 
@@ -54,6 +65,12 @@ def create_task(
 ) -> dict:
     task_id = new_task_id(task_type)
     now = db.utcnow()
+    # 重任务若已有在飞/排队，创建时给出等待文案
+    msg = "排队中"
+    if _is_heavy(task_type):
+        with _heavy_inflight_lock:
+            if _heavy_inflight > 0:
+                msg = "等待其他重任务结束…"
     row = {
         "id": task_id,
         "type": task_type,
@@ -61,7 +78,7 @@ def create_task(
         "status": "pending",
         "params": db.dumps_json(params),
         "progress": 0.0,
-        "message": "排队中",
+        "message": msg,
         "error": None,
         "created_at": now,
         "started_at": None,
@@ -125,15 +142,30 @@ def set_progress(task_id: str, progress: float, message: str = "") -> None:
 
 
 def submit_task(task_id: str) -> None:
-    if not _executor:
+    global _heavy_inflight
+    if not _started:
         start_workers()
-    assert _executor is not None
-    _executor.submit(_run_task, task_id)
-
-
-def _run_task(task_id: str) -> None:
+    assert _heavy_executor is not None and _light_executor is not None
     task = get_task(task_id)
     if not task:
+        return
+    if _is_heavy(task.get("type") or ""):
+        with _heavy_inflight_lock:
+            if _heavy_inflight > 0:
+                update_task(task_id, message="等待其他重任务结束…")
+            _heavy_inflight += 1
+        _heavy_executor.submit(_run_task, task_id, True)
+    else:
+        _light_executor.submit(_run_task, task_id, False)
+
+
+def _run_task(task_id: str, is_heavy: bool) -> None:
+    global _heavy_inflight
+    task = get_task(task_id)
+    if not task:
+        if is_heavy:
+            with _heavy_inflight_lock:
+                _heavy_inflight = max(0, _heavy_inflight - 1)
         return
     handler = _handlers.get(task["type"] or "")
     if not handler:
@@ -143,23 +175,10 @@ def _run_task(task_id: str) -> None:
             error=f"未知任务类型: {task['type']}",
             finished_at=db.utcnow(),
         )
+        if is_heavy:
+            with _heavy_inflight_lock:
+                _heavy_inflight = max(0, _heavy_inflight - 1)
         return
-
-    # 重 CPU 任务串行（含续训、视频抽帧、OpenVINO 导出）
-    heavy = task["type"] in {
-        "autolabel",
-        "openvocab",
-        "track",
-        "train",
-        "train_resume",
-        "export",
-        "evaluate",
-        "openvino_export",
-        "import_video",
-    }
-    if heavy:
-        update_task(task_id, message="等待其他重任务结束…")
-        _heavy_lock.acquire()
 
     try:
         update_task(
@@ -189,8 +208,9 @@ def _run_task(task_id: str) -> None:
             finished_at=db.utcnow(),
         )
     finally:
-        if heavy:
-            _heavy_lock.release()
+        if is_heavy:
+            with _heavy_inflight_lock:
+                _heavy_inflight = max(0, _heavy_inflight - 1)
 
 
 def is_training_running() -> bool:
