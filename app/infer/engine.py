@@ -145,14 +145,25 @@ def predict_boxes_batch(
     return all_boxes
 
 
-def export_openvino(pt_path: str | Path, imgsz: int = 416) -> Optional[Path]:
-    """导出 OpenVINO，失败返回 None（优雅降级）。"""
+def export_openvino(
+    pt_path: str | Path, imgsz: int = 416, *, dynamic: bool = True
+) -> Optional[Path]:
+    """导出 OpenVINO，失败返回 None（优雅降级）。
+
+    dynamic=True：接受任意 imgsz/batch，避免训练 416、预标注 640 时 shape 报错。
+    """
     try:
         pt = Path(pt_path).resolve()
         if not pt.is_file():
             return None
         model = load_model(pt, prefer_openvino=False)
-        out = model.export(format="openvino", imgsz=imgsz, half=False, device="cpu")
+        out = model.export(
+            format="openvino",
+            imgsz=imgsz,
+            half=False,
+            device="cpu",
+            dynamic=dynamic,
+        )
         out_path = Path(str(out))
         # 复制/移动到 models 目录规范位置
         target = config.MODELS_DIR / f"{pt.stem}_openvino_model"

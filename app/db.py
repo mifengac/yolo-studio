@@ -147,6 +147,8 @@ def init_db() -> None:
                 "openvino_path": "TEXT",
                 # pending | exporting | ready | failed；旧数据 NULL 按 openvino_path 兼容
                 "ov_status": "TEXT",
+                "export_imgsz": "INTEGER",  # OpenVINO 导出时的尺寸
+                "export_dynamic": "INTEGER",  # 1=动态形状，0=静态
             },
         )
         # 旧记录兼容：有 openvino_path 视为 ready，否则 pending
