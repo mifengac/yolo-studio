@@ -69,6 +69,8 @@ document.addEventListener("DOMContentLoaded", () => {
         _logEs: null,
         _chart: null,
         _poll: null,
+        _jobsPoll: null,
+        evalDatasetId: "",
       };
     },
     computed: {
@@ -86,13 +88,24 @@ document.addEventListener("DOMContentLoaded", () => {
         setTimeout(() => { if (this.toast === msg) this.toast = ""; }, 3200);
       },
       go(page) {
+        // 离开标注页时卸载监听，避免重复绑定
+        if (this.page === "labeler" && page !== "labeler" && window.YSLabeler) {
+          window.YSLabeler.destroy();
+        }
         this.page = page;
+        if (this._jobsPoll) {
+          clearInterval(this._jobsPoll);
+          this._jobsPoll = null;
+        }
         if (page === "datasets") this.loadDatasets();
         if (page === "train") {
           this.loadDatasets();
           this.loadBaseModels();
           this.loadJobs();
           if (this.currentDs) this.trainForm.dataset_id = this.currentDs.id;
+          this.$nextTick(() => this.refreshEstimate());
+          // 训练页自动刷新任务列表进度
+          this._jobsPoll = setInterval(() => this.loadJobs(), 5000);
         }
         if (page === "models") this.loadModels();
         if (page === "labeler" && this.currentDs) {
@@ -176,10 +189,14 @@ document.addEventListener("DOMContentLoaded", () => {
           const fd = new FormData();
           fd.append("file", input.files[0]);
           try {
-            this.taskMsg[d.id] = "正在抽帧…";
-            const r = await YS.api(`/api/datasets/${d.id}/import/video`, { method: "POST", body: fd });
-            this.taskMsg[d.id] = `抽帧完成 ${r.frames} 帧`;
-            await this.loadDatasets();
+            this.taskMsg[d.id] = "上传中…";
+            const t = await YS.api(`/api/datasets/${d.id}/import/video`, { method: "POST", body: fd });
+            // 接口返回后台任务，轮询进度
+            if (t && t.id) this.pollTask(t.id, d.id);
+            else {
+              this.taskMsg[d.id] = `抽帧完成 ${t.frames || 0} 帧`;
+              await this.loadDatasets();
+            }
           } catch (e) {
             this.taskMsg[d.id] = e.message;
           }
@@ -203,7 +220,12 @@ document.addEventListener("DOMContentLoaded", () => {
           const t = await YS.api(`/api/datasets/${d.id}/autolabel`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ scope: "unlabeled", conf: 0.25, overwrite: false }),
+            body: JSON.stringify({
+              model: "default",
+              scope: "unlabeled",
+              conf: 0.25,
+              overwrite: false,
+            }),
           });
           this.pollTask(t.id, d.id);
         } catch (e) {
@@ -216,14 +238,64 @@ document.addEventListener("DOMContentLoaded", () => {
           "motorcycle with front wheel lifted, three people on one motorcycle"
         );
         if (!prompts) return;
+        const full = confirm("点「确定」跑全量；点「取消」只试 20 张（更快）");
         try {
+          const body = {
+            prompts: prompts.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
+            conf: 0.1,
+          };
+          if (!full) body.preview_limit = 20;
           const t = await YS.api(`/api/datasets/${d.id}/autolabel/openvocab`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          this.pollTask(t.id, d.id);
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      async editClasses(d) {
+        const cur = (d.classes || []).join(", ");
+        const text = prompt("编辑类别（逗号分隔，顺序很重要，改顺序会影响已有标注）", cur);
+        if (text == null) return;
+        const classes = text.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean);
+        if (!classes.length) {
+          this.showToast("至少保留一个类别");
+          return;
+        }
+        try {
+          await YS.api(`/api/datasets/${d.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ classes }),
+          });
+          this.showToast("类别已更新");
+          await this.loadDatasets();
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      async runTrack(d) {
+        // 需要起始图：取数据集第一张（或用户在标注页当前图）
+        try {
+          const r = await YS.api(`/api/datasets/${d.id}/images?page_size=1&sort=filename`);
+          const start = (r.items || [])[0];
+          if (!start) {
+            this.showToast("数据集还没有图片，请先导入视频或图片");
+            return;
+          }
+          const maxStr = prompt("从第一张起最多跟踪多少帧？（默认 300，上限 300）", "300");
+          if (maxStr == null) return;
+          const max_frames = Math.min(300, Math.max(1, parseInt(maxStr, 10) || 300));
+          const t = await YS.api(`/api/datasets/${d.id}/track`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              prompts: prompts.split(/[,，]/).map((s) => s.trim()).filter(Boolean),
-              conf: 0.1,
-              preview_limit: 20,
+              start_image_id: start.id,
+              max_frames,
+              model: "default",
+              conf: 0.25,
             }),
           });
           this.pollTask(t.id, d.id);
@@ -276,10 +348,20 @@ document.addEventListener("DOMContentLoaded", () => {
       },
       async startTrain() {
         try {
+          const body = {
+            dataset_id: this.trainForm.dataset_id,
+            base_model: this.trainForm.base_model,
+            epochs: this.trainForm.epochs,
+            imgsz: this.trainForm.imgsz,
+            batch: this.trainForm.batch,
+            freeze: this.trainForm.freeze,
+            only_confirmed: this.trainForm.only_confirmed,
+            force_long: this.trainForm.force_long,
+          };
           const j = await YS.api("/api/train", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(this.trainForm),
+            body: JSON.stringify(body),
           });
           this.showToast("训练已提交 " + j.id);
           await this.loadJobs();
@@ -312,7 +394,7 @@ document.addEventListener("DOMContentLoaded", () => {
             headers: { "Content-Type": "application/json" },
             body: "{}",
           });
-          this.showToast("已发布 " + m.name);
+          this.showToast("已发布 " + m.name + "；OpenVINO 导出在后台进行");
           this.loadModels();
         } catch (e) {
           this.showToast(e.message);
@@ -358,7 +440,10 @@ document.addEventListener("DOMContentLoaded", () => {
         this._chart.setOption({
           backgroundColor: "transparent",
           tooltip: { trigger: "axis" },
-          legend: { data: ["box_loss", "cls_loss", "mAP50"], textStyle: { color: "#94a3b8" } },
+          legend: {
+            data: ["box_loss", "cls_loss", "mAP50", "mAP50-95"],
+            textStyle: { color: "#94a3b8" },
+          },
           xAxis: { type: "category", data: epochs, axisLabel: { color: "#94a3b8" } },
           yAxis: [
             { type: "value", name: "loss", axisLabel: { color: "#94a3b8" }, splitLine: { lineStyle: { color: "#334155" } } },
@@ -368,6 +453,13 @@ document.addEventListener("DOMContentLoaded", () => {
             { name: "box_loss", type: "line", data: series.map((s) => s.box_loss), smooth: true },
             { name: "cls_loss", type: "line", data: series.map((s) => s.cls_loss), smooth: true },
             { name: "mAP50", type: "line", yAxisIndex: 1, data: series.map((s) => s.mAP50), smooth: true },
+            {
+              name: "mAP50-95",
+              type: "line",
+              yAxisIndex: 1,
+              data: series.map((s) => s["mAP50-95"] != null ? s["mAP50-95"] : s.mAP50_95),
+              smooth: true,
+            },
           ],
         });
       },
@@ -378,6 +470,26 @@ document.addEventListener("DOMContentLoaded", () => {
         await YS.api(`/api/models/${m.id}/set-default-autolabel`, { method: "POST" });
         this.showToast("已设为默认预标注模型");
         this.loadModels();
+      },
+      async evalModel(m) {
+        const dsId = this.evalDatasetId || (this.currentDs && this.currentDs.id) || (this.datasets[0] && this.datasets[0].id);
+        if (!dsId) {
+          this.showToast("请先选择或创建一个数据集再评估");
+          return;
+        }
+        try {
+          this.showToast("评估中（CPU 可能要一会儿）…");
+          const r = await YS.api(`/api/models/${m.id}/evaluate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ dataset_id: dsId, conf: 0.25, imgsz: 416 }),
+          });
+          this.showToast(
+            `评估完成：P≈${r.precision_approx} R≈${r.recall_approx}（${r.note || "粗评"}）`
+          );
+        } catch (e) {
+          this.showToast(e.message);
+        }
       },
       async delModel(m) {
         if (!confirm("确定删除模型 " + m.name + "？")) return;

@@ -17,10 +17,11 @@ router = APIRouter(prefix="/api/train", tags=["train"])
 @router.post("/estimate")
 def estimate(body: TrainEstimateRequest):
     try:
+        # 预估用默认门槛 10；不足时仍返回数字 + warnings，不阻断表单
         report = export_svc.validate_for_train(
             body.dataset_id,
             only_confirmed=body.only_confirmed,
-            min_boxes_per_class=1,
+            min_boxes_per_class=10,
         )
     except (LookupError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
@@ -39,11 +40,17 @@ def estimate(body: TrainEstimateRequest):
         freeze=body.freeze,
         cache=cache,
     )
+    tips = list(est.get("tips") or [])
+    for w in report.get("warnings") or []:
+        if w not in tips:
+            tips.append(w)
     return {
         "image_count": n,
         "class_counts": report["class_counts"],
         "warnings": report.get("warnings") or [],
+        "data_ok": report.get("ok", False),
         **est,
+        "tips": tips,
     }
 
 

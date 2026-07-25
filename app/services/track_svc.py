@@ -14,34 +14,84 @@ from app.services.autolabel_svc import uncertainty_of_boxes
 logger = logging.getLogger(__name__)
 
 
+def save_video_temp(
+    dataset_id: str,
+    video_bytes: bytes,
+    filename: str,
+) -> dict:
+    """仅落盘临时视频，供后台抽帧任务使用。"""
+    dataset_svc.get_dataset(dataset_id)
+    group_key = f"video_{time.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+    root = dataset_svc.ensure_dataset_dirs(dataset_id)
+    suffix = Path(filename).suffix or ".mp4"
+    tmp = root / "exports" / f"_tmp_{group_key}{suffix}"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_bytes(video_bytes)
+    return {
+        "tmp_path": str(tmp),
+        "group_key": group_key,
+        "filename": filename,
+    }
+
+
 def import_video(
     dataset_id: str,
     video_bytes: bytes,
     filename: str,
     fps: float = 2.0,
+    *,
+    progress_cb=None,
 ) -> dict:
-    """抽帧入库，同一视频写同一 group_key。"""
+    """抽帧入库（同步；后台任务请用 run_import_video）。"""
+    meta = save_video_temp(dataset_id, video_bytes, filename)
+    return _extract_frames(
+        dataset_id,
+        tmp_path=meta["tmp_path"],
+        group_key=meta["group_key"],
+        fps=fps,
+        progress_cb=progress_cb,
+    )
+
+
+def _extract_frames(
+    dataset_id: str,
+    *,
+    tmp_path: str,
+    group_key: str,
+    fps: float = 2.0,
+    progress_cb=None,
+) -> dict:
     import cv2
-    import tempfile
-    import os
 
-    dataset_svc.get_dataset(dataset_id)
-    group_key = f"video_{time.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
-    root = dataset_svc.ensure_dataset_dirs(dataset_id)
-    tmp = root / "exports" / f"_tmp_{group_key}{Path(filename).suffix or '.mp4'}"
-    tmp.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_bytes(video_bytes)
-
+    tmp = Path(tmp_path)
     cap = cv2.VideoCapture(str(tmp))
     if not cap.isOpened():
         tmp.unlink(missing_ok=True)
         raise ValueError("无法打开视频文件")
 
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     interval = max(1, int(round(video_fps / max(fps, 0.1))))
+    # 预估将保存的帧数（上限 5000）
+    expected = min(5000, (total_frames // interval) + 1) if total_frames > 0 else 0
+
     frame_idx = 0
     saved = 0
-    files: list[tuple[str, bytes]] = []
+    batch: list[tuple[str, bytes]] = []
+    batch_size = 50
+    imported_total = 0
+    skipped_dup = 0
+
+    def flush_batch() -> None:
+        nonlocal imported_total, skipped_dup, batch
+        if not batch:
+            return
+        r = dataset_svc.import_files(
+            dataset_id, batch, source="video", group_key=group_key
+        )
+        imported_total += int(r.get("imported") or 0)
+        skipped_dup += int(r.get("skipped_dup") or 0)
+        batch = []
 
     try:
         while True:
@@ -52,21 +102,62 @@ def import_video(
                 name = f"{group_key}_f{frame_idx:06d}.jpg"
                 ok2, buf = cv2.imencode(".jpg", frame)
                 if ok2:
-                    files.append((name, buf.tobytes()))
+                    batch.append((name, buf.tobytes()))
                     saved += 1
+                    if len(batch) >= batch_size:
+                        flush_batch()
+                    if progress_cb:
+                        denom = expected or max(saved, 1)
+                        progress_cb(
+                            min(99.0, 100.0 * saved / denom),
+                            f"已抽 {saved}" + (f"/{expected}" if expected else "") + " 帧",
+                        )
             frame_idx += 1
             if saved >= 5000:
                 break
+        flush_batch()
     finally:
         cap.release()
         tmp.unlink(missing_ok=True)
 
-    result = dataset_svc.import_files(
-        dataset_id, files, source="video", group_key=group_key
+    if progress_cb:
+        progress_cb(100.0, f"抽帧完成 {saved} 帧")
+    return {
+        "imported": imported_total,
+        "skipped_dup": skipped_dup,
+        "group_key": group_key,
+        "frames": saved,
+    }
+
+
+def run_import_video(task: dict) -> None:
+    """后台任务：从临时文件抽帧入库。"""
+    from app import tasks as task_mod
+
+    params = task.get("params") or {}
+    dataset_id = task.get("dataset_id") or params.get("dataset_id")
+    task_id = task["id"]
+    tmp_path = params.get("tmp_path")
+    group_key = params.get("group_key") or f"video_{uuid4().hex[:8]}"
+    fps = float(params.get("fps", 2.0))
+    if not dataset_id or not tmp_path:
+        raise ValueError("import_video 缺少 dataset_id 或 tmp_path")
+
+    def progress_cb(p: float, msg: str) -> None:
+        task_mod.set_progress(task_id, p, msg)
+
+    result = _extract_frames(
+        dataset_id,
+        tmp_path=tmp_path,
+        group_key=group_key,
+        fps=fps,
+        progress_cb=progress_cb,
     )
-    result["group_key"] = group_key
-    result["frames"] = saved
-    return result
+    task_mod.update_task(
+        task_id,
+        message=f"抽帧完成 {result.get('frames', 0)} 帧，导入 {result.get('imported', 0)} 张",
+        params={**params, "result": result},
+    )
 
 
 def run_track(task: dict) -> None:

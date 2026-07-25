@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""冒烟测试：建数据集 → 导图 → 存标注 → 导出 →（可选）短训。
+"""冒烟测试：建数据集 → 导图 → 预标注 → 存标注 → 导出预估 →（可选）短训。
 
 用法：
   # 服务已在 5016 启动时
   python scripts/smoke_test.py
 
-  # 含 2 epoch 训练（需 weights/yolo26n.pt 或微调底模）
+  # 含 2 epoch 训练（需 weights 下可用底模；每类框数门槛放宽为 1）
   python scripts/smoke_test.py --train
 """
 
@@ -35,6 +35,16 @@ def make_image_bytes(i: int) -> bytes:
     buf = io.BytesIO()
     im.save(buf, format="JPEG")
     return buf.getvalue()
+
+
+def wait_task(c: httpx.Client, task_id: str, timeout: float = 300.0) -> dict:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        t = c.get(f"/api/tasks/{task_id}").json()
+        if t.get("status") in ("success", "failed", "canceled"):
+            return t
+        time.sleep(1.5)
+    raise TimeoutError(f"task {task_id} timeout")
 
 
 def main() -> int:
@@ -68,12 +78,29 @@ def main() -> int:
     r.raise_for_status()
     print("   ", r.json())
 
-    print("4) list images + put annotations")
+    print("4) autolabel (model=default，无权重则跳过)")
+    r = c.post(
+        f"/api/datasets/{ds_id}/autolabel",
+        json={"model": "default", "scope": "unlabeled", "conf": 0.25, "overwrite": False},
+    )
+    if r.status_code < 400:
+        task = r.json()
+        print("   task", task.get("id"), "model=", (task.get("params") or {}).get("model"))
+        try:
+            done = wait_task(c, task["id"], timeout=180)
+            print("   autolabel", done.get("status"), done.get("message"), done.get("error"))
+        except Exception as exc:
+            print("   autolabel wait:", exc)
+    else:
+        print("   skip autolabel:", r.status_code, r.text[:200])
+
+    print("5) list images + put annotations")
     r = c.get(f"/api/datasets/{ds_id}/images")
     r.raise_for_status()
     items = r.json()["items"]
     assert len(items) >= 5
     for img in items:
+        # 每类至少 1 框，方便 --train 放宽门槛
         boxes = [
             {
                 "class_idx": 0,
@@ -83,7 +110,16 @@ def main() -> int:
                 "h": 0.25,
                 "conf": 1.0,
                 "source": "manual",
-            }
+            },
+            {
+                "class_idx": 1,
+                "cx": 0.6,
+                "cy": 0.55,
+                "w": 0.18,
+                "h": 0.22,
+                "conf": 1.0,
+                "source": "manual",
+            },
         ]
         rr = c.put(
             f"/api/images/{img['id']}/annotations",
@@ -92,7 +128,7 @@ def main() -> int:
         rr.raise_for_status()
     print("   annotated", len(items))
 
-    print("5) export via train estimate")
+    print("6) train estimate")
     r = c.post(
         "/api/train/estimate",
         json={
@@ -104,12 +140,10 @@ def main() -> int:
             "only_confirmed": True,
         },
     )
-    # 可能因无权重报错，只打印
-    print("   estimate status", r.status_code, r.text[:200])
+    print("   estimate status", r.status_code, r.text[:240])
 
     if args.train:
-        print("6) short train 2 epoch imgsz=320")
-        # 找可用底模
+        print("7) short train 2 epoch imgsz=320")
         info = c.get("/api/system/info").json()
         base_model = None
         for w in info.get("weights") or []:
@@ -118,11 +152,17 @@ def main() -> int:
                 break
         if not base_model:
             for w in info.get("weights") or []:
-                if w.get("available") and w["name"].endswith(".pt") and "sam" not in w["name"] and "world" not in w["name"]:
+                if (
+                    w.get("available")
+                    and w["name"].endswith(".pt")
+                    and "sam" not in w["name"]
+                    and "world" not in w["name"]
+                ):
                     base_model = w["name"]
                     break
         if not base_model:
             print("   跳过训练：weights/ 下无可用检测底模")
+            print("SMOKE OK (no train)")
             return 0
         r = c.post(
             "/api/train",
@@ -136,6 +176,7 @@ def main() -> int:
                 "only_confirmed": True,
                 "workers": 2,
                 "force_long": True,
+                "min_boxes_per_class": 1,
             },
         )
         if r.status_code >= 400:
@@ -144,6 +185,7 @@ def main() -> int:
         job = r.json()
         job_id = job["id"]
         print("   job", job_id)
+        j = job
         for _ in range(600):
             j = c.get(f"/api/train/{job_id}").json()
             print(f"   status={j['status']} epoch={j.get('last_epoch')}")
@@ -153,9 +195,8 @@ def main() -> int:
         assert j["status"] == "success", j
         assert j.get("best_pt"), "missing best_pt"
         print("   best_pt", j["best_pt"])
-        # publish
         m = c.post(f"/api/train/{job_id}/publish", json={}).json()
-        print("   published", m["id"], "openvino", m.get("openvino_path"))
+        print("   published", m["id"], "openvino", m.get("openvino_path"), "(异步导出可能稍后才有)")
 
     print("SMOKE OK")
     return 0

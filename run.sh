@@ -5,8 +5,10 @@ cd "$(dirname "$0")"
 if [[ ! -d .venv ]]; then
   python3 -m venv .venv
   .venv/bin/pip install -U pip
-  # CPU 版 torch
-  .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  # CPU 版 torch（钉版本，与 Dockerfile / requirements.txt 一致）
+  .venv/bin/pip install \
+    torch==2.5.1 torchvision==0.20.1 \
+    --index-url https://download.pytorch.org/whl/cpu
   .venv/bin/pip install -r requirements.txt
 fi
 

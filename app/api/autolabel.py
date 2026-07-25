@@ -18,9 +18,16 @@ def autolabel(dataset_id: str, body: AutolabelRequest):
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
 
-    model = body.model
+    model = (body.model or "").strip()
     if not model or model in ("default", "auto"):
-        model = model_svc.get_default_autolabel_path() or body.model
+        resolved = model_svc.get_default_autolabel_path()
+        if not resolved:
+            raise HTTPException(
+                400,
+                "没有可用的默认预标注模型。请先在「模型仓库」设默认，"
+                "或把 0517_yolo26s/n_wheelie_multi-rider.pt 放到 weights/。",
+            )
+        model = resolved
 
     task = task_mod.create_task(
         "autolabel",
@@ -70,13 +77,21 @@ def track(dataset_id: str, body: TrackRequest):
         dataset_svc.get_dataset(dataset_id)
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
+    model = (body.model or "").strip()
+    if not model or model in ("default", "auto"):
+        model = model_svc.get_default_autolabel_path() or model
+        if not model or model in ("default", "auto"):
+            raise HTTPException(
+                400,
+                "没有可用的跟踪/预标注模型。请在模型仓库设默认，或放置 0517 权重到 weights/。",
+            )
     task = task_mod.create_task(
         "track",
         {
             "dataset_id": dataset_id,
             "start_image_id": body.start_image_id,
             "max_frames": body.max_frames,
-            "model": body.model,
+            "model": model,
             "conf": body.conf,
         },
         dataset_id=dataset_id,

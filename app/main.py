@@ -30,11 +30,15 @@ logger = logging.getLogger(__name__)
 
 
 def _register_task_handlers() -> None:
+    from app.services import model_svc
+
     tasks.register_handler("autolabel", autolabel_svc.run_autolabel)
     tasks.register_handler("openvocab", openvocab_svc.run_openvocab)
     tasks.register_handler("track", track_svc.run_track)
     tasks.register_handler("dedup", dedup_svc.run_dedup)
     tasks.register_handler("train", train_svc.run_train_job)
+    tasks.register_handler("openvino_export", model_svc.run_openvino_export)
+    tasks.register_handler("import_video", track_svc.run_import_video)
 
 
 @asynccontextmanager
@@ -62,6 +66,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        killed = train_svc.kill_running_train_processes()
+        if killed:
+            logger.warning("关闭时终止 %s 个训练进程", killed)
         tasks.stop_workers()
         logger.info("YOLO Studio 已停止")
 

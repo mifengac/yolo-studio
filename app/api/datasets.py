@@ -92,6 +92,9 @@ async def import_zip(dataset_id: str, file: UploadFile = File(...)):
 async def import_video(
     dataset_id: str, file: UploadFile = File(...), fps: float = 2.0
 ):
+    """上传视频后立刻返回 task，后台抽帧并回报进度。"""
+    from app import tasks as task_mod
+
     try:
         dataset_svc.get_dataset(dataset_id)
     except LookupError as e:
@@ -100,11 +103,24 @@ async def import_video(
     if len(data) > config.MAX_UPLOAD_BYTES:
         raise HTTPException(400, f"视频超过 {config.MAX_UPLOAD_MB} MB 限制")
     try:
-        return track_svc.import_video(
-            dataset_id, data, file.filename or "video.mp4", fps=fps
+        meta = track_svc.save_video_temp(
+            dataset_id, data, file.filename or "video.mp4"
         )
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    task = task_mod.create_task(
+        "import_video",
+        {
+            "dataset_id": dataset_id,
+            "tmp_path": meta["tmp_path"],
+            "group_key": meta["group_key"],
+            "filename": meta["filename"],
+            "fps": fps,
+        },
+        dataset_id=dataset_id,
+        submit=True,
+    )
+    return task
 
 
 @router.get("/{dataset_id}/images")

@@ -156,19 +156,23 @@ def create_train_job(params: dict) -> dict:
 
     dataset = dataset_svc.get_dataset(dataset_id)
     only_confirmed = bool(params.get("only_confirmed", True))
-    # 校验
+    min_boxes = int(params.get("min_boxes_per_class", 10))
+    # 校验：每类至少 min_boxes 个框（默认 10；冒烟可传 1）
     report = export_svc.validate_for_train(
-        dataset_id, only_confirmed=only_confirmed, min_boxes_per_class=1
+        dataset_id, only_confirmed=only_confirmed, min_boxes_per_class=min_boxes
     )
     if not report["ok"]:
-        raise ValueError("训练数据不足：每个类别至少要有 1 个框，且至少 2 张可用图")
+        detail = "；".join(report.get("warnings") or []) or "数据不足"
+        raise ValueError(
+            f"训练数据不足：每个类别至少要有 {min_boxes} 个框，且至少 2 张可用图。"
+            f"{detail}"
+        )
 
     base_path, base_classes, is_ft = resolve_base_model(params.get("base_model", "yolo26n.pt"))
     check_finetune_compat(base_classes if is_ft else None, dataset["classes"])
 
-    epochs = int(params.get("epochs", config.DEFAULT_EPOCHS))
-    if is_ft and "epochs" not in params:
-        epochs = 20
+    # 以客户端提交的 epochs 为准；前端微调组会默认填 20
+    epochs = int(params.get("epochs", 20 if is_ft else config.DEFAULT_EPOCHS))
     imgsz = int(params.get("imgsz", config.DEFAULT_IMGSZ))
     batch = int(params.get("batch", config.DEFAULT_BATCH))
     freeze = int(params.get("freeze", config.DEFAULT_FREEZE))
@@ -573,8 +577,70 @@ def resume_job(job_id: str) -> dict:
     return get_job(job_id)
 
 
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
 def recover_interrupted_jobs() -> int:
-    """启动时扫描 running 任务，进程不在则标 interrupted。"""
+    """启动时扫描 running 任务：进程不在则标 interrupted（不自动重跑）。"""
+    with db._lock, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM train_job WHERE status='running'"
+        ).fetchall()
+    n = 0
+    for r in rows:
+        if _pid_alive(r["pid"]):
+            # 服务重启后残留的孤儿训练进程：主动终止，避免永久占 running
+            try:
+                _kill_pid(int(r["pid"]))
+            except Exception as exc:
+                logger.warning("终止残留训练 pid=%s 失败: %s", r["pid"], exc)
+        resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
+        update_job(
+            r["id"],
+            status="interrupted",
+            finished_at=db.utcnow(),
+            pid=None,
+            resume_from=resume if Path(resume).is_file() else r["resume_from"],
+        )
+        append_log(
+            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
+            "服务重启，任务中断（请点「继续训练」从断点恢复）",
+        )
+        n += 1
+    return n
+
+
+def _kill_pid(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.2)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def kill_running_train_processes() -> int:
+    """关服务时杀掉所有 running 训练子进程，并标为 interrupted。"""
     with db._lock, db.connect() as conn:
         rows = conn.execute(
             "SELECT * FROM train_job WHERE status='running'"
@@ -582,34 +648,33 @@ def recover_interrupted_jobs() -> int:
     n = 0
     for r in rows:
         pid = r["pid"]
-        alive = False
         if pid:
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except OSError:
-                alive = False
-        if not alive:
-            update_job(
-                r["id"],
-                status="interrupted",
-                finished_at=db.utcnow(),
-                pid=None,
-            )
-            append_log(r["log_path"] or (Path(r["run_dir"]) / "train.log"), "服务重启，任务中断")
-            n += 1
+            _kill_pid(int(pid))
+        resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
+        update_job(
+            r["id"],
+            status="interrupted",
+            finished_at=db.utcnow(),
+            pid=None,
+            resume_from=resume if Path(resume).is_file() else r["resume_from"],
+        )
+        append_log(
+            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
+            "服务关闭，训练进程已终止",
+        )
+        n += 1
     return n
 
 
 def publish_job(job_id: str, name: Optional[str] = None, notes: str = "") -> dict:
-    from app.services import model_svc
+    from app.services import dataset_svc, model_svc
 
     job = get_job(job_id)
     if job["status"] != "success" or not job.get("best_pt"):
         raise ValueError("只有训练成功且存在 best.pt 的任务可以发布")
-    from app.services import dataset_svc
 
     ds = dataset_svc.get_dataset(job["dataset_id"])
+    # 先快速注册 .pt，OpenVINO 走后台任务，避免 HTTP 挂几分钟
     return model_svc.register_model(
         path=job["best_pt"],
         name=name or f"{ds['name']}-{job_id[-6:]}",
@@ -617,6 +682,7 @@ def publish_job(job_id: str, name: Optional[str] = None, notes: str = "") -> dic
         metrics=job.get("metrics") or {},
         from_job=job_id,
         notes=notes,
-        export_ov=True,
+        export_ov=False,
+        schedule_openvino=True,
         imgsz=int((job.get("params") or {}).get("imgsz", 416)),
     )

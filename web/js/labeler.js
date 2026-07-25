@@ -21,9 +21,11 @@ window.YSLabeler = (function () {
   let redoStack = [];
   let dragging = null; // {type:'new'|'move'|'resize', ...}
   let spaceDown = false;
-  let lastBoxesCopy = [];
   let dirty = false;
   let saving = false;
+  let saveChain = Promise.resolve();
+  let uiBound = false;
+  let wrapEl = null;
 
   const HANDLE = 6;
 
@@ -31,7 +33,25 @@ window.YSLabeler = (function () {
     return (el || root).querySelector(sel);
   }
 
+  function onKeyUp(e) {
+    if (e.code === "Space") spaceDown = false;
+  }
+
+  function destroy() {
+    unbindUi();
+    if (root) root.innerHTML = "";
+    root = null;
+    canvas = null;
+    ctx = null;
+    imgEl = null;
+    images = [];
+    boxes = [];
+    dirty = false;
+  }
+
   function mount(dataset, vueApp) {
+    // 再次进入标注页前先卸旧监听，避免 A/D 连跳
+    destroy();
     ds = dataset;
     app = vueApp;
     root = document.getElementById("labeler-root");
@@ -79,38 +99,71 @@ window.YSLabeler = (function () {
     canvas = $("#lb-canvas");
     ctx = canvas.getContext("2d");
     bindUi();
-    loadImages();
+    loadImages().catch((e) => {
+      if (app) app.showToast(e.message || String(e));
+    });
   }
 
   function bindUi() {
+    if (uiBound) unbindUi();
     root.querySelectorAll("[data-act]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const a = btn.getAttribute("data-act");
-        if (a === "prev") nav(-1);
-        if (a === "next") nav(1);
-        if (a === "draw") mode = "draw";
-        if (a === "sam") mode = "sam";
-        if (a === "confirm") confirmAndNext();
-        if (a === "copy") copyPrev();
-        if (a === "undo") undo();
-        if (a === "redo") redo();
-      });
+      btn.addEventListener("click", onToolbarClick);
     });
-    $("#lb-conf").addEventListener("input", (e) => {
-      confMin = Number(e.target.value) / 100;
-      $("#lb-conf-v").textContent = confMin.toFixed(2);
-      draw();
-    });
-    const wrap = $("#lb-wrap");
-    wrap.addEventListener("wheel", onWheel, { passive: false });
-    wrap.addEventListener("mousedown", onDown);
+    const conf = $("#lb-conf");
+    if (conf) conf.addEventListener("input", onConfInput);
+    wrapEl = $("#lb-wrap");
+    if (wrapEl) {
+      wrapEl.addEventListener("wheel", onWheel, { passive: false });
+      wrapEl.addEventListener("mousedown", onDown);
+    }
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     window.addEventListener("keydown", onKey);
-    window.addEventListener("keyup", (e) => {
-      if (e.code === "Space") spaceDown = false;
-    });
+    window.addEventListener("keyup", onKeyUp);
     window.addEventListener("resize", fitCanvas);
+    uiBound = true;
+  }
+
+  function unbindUi() {
+    if (!uiBound) return;
+    if (root) {
+      root.querySelectorAll("[data-act]").forEach((btn) => {
+        btn.removeEventListener("click", onToolbarClick);
+      });
+      const conf = $("#lb-conf");
+      if (conf) conf.removeEventListener("input", onConfInput);
+    }
+    if (wrapEl) {
+      wrapEl.removeEventListener("wheel", onWheel);
+      wrapEl.removeEventListener("mousedown", onDown);
+      wrapEl = null;
+    }
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", onUp);
+    window.removeEventListener("keydown", onKey);
+    window.removeEventListener("keyup", onKeyUp);
+    window.removeEventListener("resize", fitCanvas);
+    uiBound = false;
+  }
+
+  function onToolbarClick(e) {
+    const btn = e.currentTarget;
+    const a = btn.getAttribute("data-act");
+    if (a === "prev") nav(-1);
+    if (a === "next") nav(1);
+    if (a === "draw") mode = "draw";
+    if (a === "sam") mode = "sam";
+    if (a === "confirm") confirmAndNext().catch((err) => app && app.showToast(err.message));
+    if (a === "copy") copyPrev().catch((err) => app && app.showToast(err.message));
+    if (a === "undo") undo();
+    if (a === "redo") redo();
+  }
+
+  function onConfInput(e) {
+    confMin = Number(e.target.value) / 100;
+    const v = $("#lb-conf-v");
+    if (v) v.textContent = confMin.toFixed(2);
+    draw();
   }
 
   async function loadImages() {
@@ -197,7 +250,9 @@ window.YSLabeler = (function () {
 
   async function selectIndex(i) {
     if (i < 0 || i >= images.length) return;
-    if (dirty) await saveCurrent(false);
+    // 串行等待未完成的保存，避免 dirty 修改被跳过
+    if (dirty) await enqueueSave(false);
+    else await saveChain;
     curIdx = i;
     selected = -1;
     undoStack = [];
@@ -206,6 +261,8 @@ window.YSLabeler = (function () {
     $("#lb-fname").textContent = `${img.filename} · ${img.review_status}`;
     const ann = await YS.api(`/api/images/${img.id}/annotations`);
     boxes = (ann.boxes || []).map((b) => ({ ...b }));
+    // 缓存本图框，便于下一张 C 复制时快速读取
+    images[curIdx]._boxesCache = boxes.map((b) => ({ ...b }));
     imgEl = new Image();
     imgEl.onload = () => {
       imgNatural = { w: imgEl.naturalWidth, h: imgEl.naturalHeight };
@@ -215,6 +272,13 @@ window.YSLabeler = (function () {
     imgEl.src = `/api/images/${img.id}/file?t=${Date.now()}`;
     renderThumbs();
     renderBoxList();
+    // 后台预热下一张（SAM / 标注）
+    if (curIdx + 1 < images.length) {
+      // fire-and-forget
+      YS.api(`/api/images/${images[curIdx + 1].id}/annotations`).then((a) => {
+        images[curIdx + 1]._boxesCache = (a.boxes || []).map((b) => ({ ...b }));
+      }).catch(() => {});
+    }
   }
 
   function fitCanvas() {
@@ -504,19 +568,32 @@ window.YSLabeler = (function () {
     }
   }
 
+  function enqueueSave(setReviewed = true) {
+    saveChain = saveChain.then(() => saveCurrent(setReviewed)).catch((e) => {
+      if (app) app.showToast(e.message || String(e));
+    });
+    return saveChain;
+  }
+
   async function saveCurrent(setReviewed = true) {
-    if (!images[curIdx] || saving) return;
+    if (!images[curIdx]) return;
+    // 串行保存：若正在保存则等上一次结束后再写当前快照
+    while (saving) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
     saving = true;
+    const idx = curIdx;
+    const snapBoxes = boxes.map((b) => ({ ...b }));
     try {
       const status = setReviewed
-        ? boxes.length
-          ? images[curIdx].review_status === "confirmed"
+        ? snapBoxes.length
+          ? images[idx].review_status === "confirmed"
             ? "confirmed"
             : "reviewed"
           : "unlabeled"
         : undefined;
       const body = {
-        boxes: boxes.map((b) => ({
+        boxes: snapBoxes.map((b) => ({
           class_idx: b.class_idx,
           cx: b.cx,
           cy: b.cy,
@@ -527,18 +604,19 @@ window.YSLabeler = (function () {
         })),
       };
       if (status) body.review_status = status;
-      const r = await YS.api(`/api/images/${images[curIdx].id}/annotations`, {
+      const r = await YS.api(`/api/images/${images[idx].id}/annotations`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      images[curIdx].box_count = r.box_count;
-      images[curIdx].review_status = r.review_status;
-      lastBoxesCopy = boxes.map((b) => ({ ...b }));
-      dirty = false;
+      images[idx].box_count = r.box_count;
+      images[idx].review_status = r.review_status;
+      images[idx]._boxesCache = snapBoxes.map((b) => ({ ...b }));
+      if (idx === curIdx) dirty = false;
       renderThumbs();
     } catch (e) {
       if (app) app.showToast(e.message);
+      throw e;
     } finally {
       saving = false;
     }
@@ -546,32 +624,35 @@ window.YSLabeler = (function () {
 
   async function confirmAndNext() {
     if (!images[curIdx]) return;
-    // 先保存为 confirmed
-    const body = {
-      boxes: boxes.map((b) => ({
-        class_idx: b.class_idx,
-        cx: b.cx,
-        cy: b.cy,
-        w: b.w,
-        h: b.h,
-        conf: b.conf == null ? 1 : b.conf,
-        source: b.source || "manual",
-      })),
-      review_status: "confirmed",
-    };
-    await YS.api(`/api/images/${images[curIdx].id}/annotations`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    images[curIdx].review_status = "confirmed";
-    images[curIdx].box_count = boxes.length;
-    dirty = false;
-    lastBoxesCopy = boxes.map((b) => ({ ...b }));
-    if (curIdx < images.length - 1) await selectIndex(curIdx + 1);
-    else {
-      renderThumbs();
-      if (app) app.showToast("已经是最后一张");
+    try {
+      const body = {
+        boxes: boxes.map((b) => ({
+          class_idx: b.class_idx,
+          cx: b.cx,
+          cy: b.cy,
+          w: b.w,
+          h: b.h,
+          conf: b.conf == null ? 1 : b.conf,
+          source: b.source || "manual",
+        })),
+        review_status: "confirmed",
+      };
+      await YS.api(`/api/images/${images[curIdx].id}/annotations`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      images[curIdx].review_status = "confirmed";
+      images[curIdx].box_count = boxes.length;
+      images[curIdx]._boxesCache = boxes.map((b) => ({ ...b }));
+      dirty = false;
+      if (curIdx < images.length - 1) await selectIndex(curIdx + 1);
+      else {
+        renderThumbs();
+        if (app) app.showToast("已经是最后一张");
+      }
+    } catch (e) {
+      if (app) app.showToast(e.message);
     }
   }
 
@@ -581,16 +662,29 @@ window.YSLabeler = (function () {
     await selectIndex(ni);
   }
 
-  function copyPrev() {
-    if (!lastBoxesCopy.length && curIdx > 0) {
-      // 若没有缓存，提示
+  async function copyPrev() {
+    if (curIdx <= 0) {
+      if (app) app.showToast("已经是第一张，没有上一张可复制");
+      return;
     }
-    if (!lastBoxesCopy.length) {
-      if (app) app.showToast("没有可复制的上一张标注");
+    const prev = images[curIdx - 1];
+    let prevBoxes = prev._boxesCache;
+    if (!prevBoxes) {
+      try {
+        const ann = await YS.api(`/api/images/${prev.id}/annotations`);
+        prevBoxes = (ann.boxes || []).map((b) => ({ ...b }));
+        prev._boxesCache = prevBoxes;
+      } catch (e) {
+        if (app) app.showToast(e.message || "读取上一张标注失败");
+        return;
+      }
+    }
+    if (!prevBoxes.length) {
+      if (app) app.showToast("上一张没有标注可复制");
       return;
     }
     pushUndo();
-    boxes = lastBoxesCopy.map((b) => ({ ...b, source: "manual" }));
+    boxes = prevBoxes.map((b) => ({ ...b, source: "manual" }));
     dirty = true;
     renderBoxList();
     draw();
@@ -654,5 +748,5 @@ window.YSLabeler = (function () {
     }
   }
 
-  return { mount };
+  return { mount, destroy };
 })();

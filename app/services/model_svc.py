@@ -74,9 +74,11 @@ def register_model(
     metrics: Optional[dict] = None,
     from_job: Optional[str] = None,
     notes: str = "",
-    export_ov: bool = True,
+    export_ov: bool = False,
+    schedule_openvino: bool = True,
     imgsz: int = 416,
 ) -> dict:
+    """注册模型。默认不同步导出 OpenVINO（CPU 上很慢），由后台任务异步导出。"""
     src = Path(path)
     if not src.is_file():
         raise FileNotFoundError(f"模型文件不存在: {path}")
@@ -86,18 +88,7 @@ def register_model(
     shutil.copy2(src, dest)
     ov_path = None
     if export_ov:
-        ov = engine.export_openvino(dest, imgsz=imgsz)
-        if ov:
-            # 规范名
-            target = config.MODELS_DIR / f"{mid}_openvino_model"
-            if ov.resolve() != target.resolve():
-                if target.exists():
-                    shutil.rmtree(target, ignore_errors=True)
-                if ov.is_dir():
-                    shutil.copytree(ov, target)
-                    ov_path = str(target)
-            else:
-                ov_path = str(target)
+        ov_path = _do_export_openvino(mid, dest, imgsz=imgsz)
 
     now = db.utcnow()
     with db._lock, db.connect() as conn:
@@ -119,7 +110,61 @@ def register_model(
                 now,
             ),
         )
+    if schedule_openvino and not ov_path:
+        try:
+            from app import tasks as task_mod
+
+            task_mod.create_task(
+                "openvino_export",
+                {"model_id": mid, "imgsz": imgsz},
+                submit=True,
+            )
+        except Exception as exc:
+            logger.warning("提交 OpenVINO 导出任务失败（模型仍可用）: %s", exc)
     return get_model(mid)
+
+
+def _do_export_openvino(model_id: str, pt_path: Path, imgsz: int = 416) -> Optional[str]:
+    ov = engine.export_openvino(pt_path, imgsz=imgsz)
+    if not ov:
+        return None
+    target = config.MODELS_DIR / f"{model_id}_openvino_model"
+    if ov.resolve() != target.resolve():
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        if ov.is_dir():
+            shutil.copytree(ov, target)
+            return str(target)
+        return None
+    return str(target)
+
+
+def run_openvino_export(task: dict) -> None:
+    """后台任务：为已注册模型导出 OpenVINO，失败只记日志不让模型不可用。"""
+    from app import tasks as task_mod
+
+    params = task.get("params") or {}
+    model_id = params.get("model_id")
+    imgsz = int(params.get("imgsz", 416))
+    task_id = task["id"]
+    if not model_id:
+        raise ValueError("缺少 model_id")
+    m = get_model(model_id)
+    task_mod.set_progress(task_id, 10, f"正在导出 OpenVINO：{m['name']}")
+    ov_path = _do_export_openvino(model_id, Path(m["path"]), imgsz=imgsz)
+    if ov_path:
+        with db._lock, db.connect() as conn:
+            conn.execute(
+                "UPDATE model SET openvino_path=? WHERE id=?",
+                (ov_path, model_id),
+            )
+        task_mod.set_progress(task_id, 100, f"OpenVINO 导出完成：{ov_path}")
+    else:
+        task_mod.update_task(
+            task_id,
+            message="OpenVINO 导出失败，继续使用 .pt 推理",
+        )
+        logger.warning("模型 %s OpenVINO 导出失败，已降级为 .pt", model_id)
 
 
 def set_default_autolabel(model_id: str) -> dict:

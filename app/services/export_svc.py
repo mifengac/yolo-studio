@@ -187,11 +187,13 @@ def validate_for_train(
     bad = []
     for i, c in enumerate(class_counts):
         if c < min_boxes_per_class:
-            bad.append(f"「{ds['classes'][i]}」只有 {c} 个框（建议至少 {min_boxes_per_class}）")
-    # 冒烟测试可放宽
+            bad.append(
+                f"「{ds['classes'][i]}」只有 {c} 个框（至少需要 {min_boxes_per_class}）"
+            )
     return {
         "image_count": len(items),
         "class_counts": class_counts,
         "warnings": bad,
-        "ok": len(items) >= 2 and all(c >= 1 for c in class_counts),
+        "ok": len(items) >= 2 and all(c >= min_boxes_per_class for c in class_counts),
+        "min_boxes_per_class": min_boxes_per_class,
     }

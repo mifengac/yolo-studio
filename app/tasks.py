@@ -145,15 +145,17 @@ def _run_task(task_id: str) -> None:
         )
         return
 
-    # 重 CPU 任务串行
+    # 重 CPU 任务串行（含续训、视频抽帧、OpenVINO 导出）
     heavy = task["type"] in {
         "autolabel",
         "openvocab",
         "track",
         "train",
+        "train_resume",
         "export",
         "evaluate",
         "openvino_export",
+        "import_video",
     }
     if heavy:
         update_task(task_id, message="等待其他重任务结束…")

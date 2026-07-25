@@ -56,7 +56,7 @@
               已确认 {{ d.confirmed_count || 0 }} ·
               框 {{ d.box_count || 0 }}
             </div>
-            <div class="hint" v-if="(d.labeled_count||0) >= 50 && (d.labeled_count||0) < 300">
+            <div class="hint" v-if="(d.labeled_count||0) >= 50">
               本数据集已标注 {{ d.labeled_count }} 张，建议现在训练一版新模型，之后的预标注会更准。
             </div>
             <div class="row wrap">
@@ -66,7 +66,9 @@
               <button @click="uploadVideo(d)">导入视频</button>
               <button @click="runAutolabel(d)">模型预标注</button>
               <button @click="runOpenvocab(d)">开放词表</button>
+              <button @click="runTrack(d)">视频跟踪传播</button>
               <button @click="runDedup(d)">近重复去重</button>
+              <button @click="editClasses(d)">编辑类别</button>
               <button class="danger" @click="removeDataset(d)">删除</button>
             </div>
             <div v-if="taskMsg[d.id]" class="task-msg">{{ taskMsg[d.id] }}</div>
@@ -87,7 +89,7 @@
         <div class="card form-card" v-if="currentDs || trainForm.dataset_id">
           <div class="row wrap">
             <label>数据集
-              <select v-model="trainForm.dataset_id">
+              <select v-model="trainForm.dataset_id" @change="refreshEstimate">
                 <option v-for="d in datasets" :key="d.id" :value="d.id">{{ d.name }}</option>
               </select>
             </label>
@@ -98,7 +100,7 @@
               </select>
             </label>
             <label>底模
-              <select v-model="trainForm.base_model">
+              <select v-model="trainForm.base_model" @change="refreshEstimate">
                 <option v-for="m in baseModelOptions" :key="m.id" :value="m.id" :disabled="!m.available">
                   {{ m.label }}{{ m.available ? '' : '（未放置权重）' }}
                 </option>
@@ -111,7 +113,7 @@
           <div class="row wrap">
             <label>轮次 <input type="number" v-model.number="trainForm.epochs" min="1" max="300" @change="refreshEstimate" /></label>
             <label>尺寸 <input type="number" v-model.number="trainForm.imgsz" min="128" max="1280" step="32" @change="refreshEstimate" /></label>
-            <label>batch <input type="number" v-model.number="trainForm.batch" min="1" max="64" /></label>
+            <label>batch <input type="number" v-model.number="trainForm.batch" min="1" max="64" @change="refreshEstimate" /></label>
             <label>freeze <input type="number" v-model.number="trainForm.freeze" min="0" max="50" @change="refreshEstimate" /></label>
             <label><input type="checkbox" v-model="trainForm.only_confirmed" @change="refreshEstimate" /> 仅已确认样本</label>
             <label v-if="estimate && estimate.blocked"><input type="checkbox" v-model="trainForm.force_long" /> 我知道会很久，仍然继续</label>
@@ -150,6 +152,10 @@
           <div v-if="j.metrics && j.metrics.mAP50 != null" class="muted">
             mAP50={{ j.metrics.mAP50 }} · mAP50-95={{ j.metrics['mAP50-95'] }} · P={{ j.metrics.precision }} · R={{ j.metrics.recall }}
           </div>
+          <div class="row wrap" v-if="j.status==='success' && j.best_pt">
+            <a class="button" :href="'/api/train/'+j.id+'/artifacts/best.pt'">下载 best.pt</a>
+            <a class="button" :href="'/api/train/'+j.id+'/artifacts/last.pt'">下载 last.pt</a>
+          </div>
         </div>
 
         <div v-if="activeJob" class="card">
@@ -162,16 +168,31 @@
       <!-- 模型仓库 -->
       <section v-else-if="page==='models'" class="panel">
         <h2>模型仓库</h2>
+        <div class="row" style="margin-bottom:12px" v-if="datasets.length">
+          <label>评估用数据集
+            <select v-model="evalDatasetId">
+              <option value="">（选择）</option>
+              <option v-for="d in datasets" :key="d.id" :value="d.id">{{ d.name }}</option>
+            </select>
+          </label>
+        </div>
         <div class="card" v-for="m in modelList" :key="m.id">
           <div class="row between">
             <div>
               <strong>{{ m.name }}</strong>
               <span class="pill" v-if="m.is_default_autolabel">默认预标注</span>
+              <span class="pill" v-if="m.openvino_path">OpenVINO</span>
+              <span class="muted" v-else>OpenVINO 未就绪 / 导出中</span>
               <div class="muted">{{ m.id }} · {{ m.path }}</div>
               <div class="tags"><span class="tag" v-for="c in m.classes" :key="c">{{ c }}</span></div>
+              <div class="muted" v-if="m.metrics && (m.metrics.mAP50 != null)">
+                训练指标 mAP50={{ m.metrics.mAP50 }} · mAP50-95={{ m.metrics['mAP50-95'] }}
+                · P={{ m.metrics.precision }} · R={{ m.metrics.recall }}
+              </div>
             </div>
             <div class="row">
               <button class="primary" @click="setDefaultModel(m)">设为默认预标注</button>
+              <button @click="evalModel(m)">评估</button>
               <a class="button" :href="'/api/models/'+m.id+'/download'">下载</a>
               <button class="danger" @click="delModel(m)">删除</button>
             </div>

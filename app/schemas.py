@@ -35,7 +35,8 @@ class AnnotationsPut(BaseModel):
 
 
 class AutolabelRequest(BaseModel):
-    model: str = "weights/0517_yolo26s_wheelie_multi-rider.pt"
+    # "default"/"auto" 时走模型仓库默认预标注路径，闭环才能生效
+    model: str = "default"
     conf: float = 0.25
     iou: float = 0.5
     imgsz: int = 640
@@ -62,7 +63,7 @@ class SamRequest(BaseModel):
 class TrackRequest(BaseModel):
     start_image_id: str
     max_frames: int = 300
-    model: str = "weights/0517_yolo26s_wheelie_multi-rider.pt"
+    model: str = "default"
     conf: float = 0.25
 
 
@@ -90,6 +91,8 @@ class TrainCreateRequest(BaseModel):
     workers: int = 8
     augment_preset: str = "default"
     force_long: bool = False  # 超过 24h 时需勾选
+    # 每类最少框数；默认 10。冒烟测试可传 1
+    min_boxes_per_class: int = 10
 
 
 class ModelRegisterRequest(BaseModel):

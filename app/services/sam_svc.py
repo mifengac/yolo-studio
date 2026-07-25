@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _predictor = None
+# image_id -> numpy RGB array（CPU 上编码贵，至少复用原图数组）
 _embed_cache: OrderedDict[str, Any] = OrderedDict()
 _MAX = config.SAM_EMBED_CACHE_SIZE
 
@@ -57,6 +58,22 @@ def _cache_put(image_id: str, value: Any) -> None:
         _embed_cache.popitem(last=False)
 
 
+def _load_rgb(image_id: str) -> tuple[np.ndarray, int, int]:
+    cached = _cache_get(image_id)
+    if cached is not None:
+        arr, w, h = cached
+        return arr, w, h
+    img = dataset_svc.get_image(image_id)
+    path = dataset_svc.image_file_path(img)
+    if not path.is_file():
+        raise FileNotFoundError("原图丢失")
+    with Image.open(path) as im:
+        w, h = im.size
+        arr = np.array(im.convert("RGB"))
+    _cache_put(image_id, (arr, w, h))
+    return arr, w, h
+
+
 def predict_box_from_points(
     image_id: str,
     points: list[list[float]],
@@ -65,22 +82,14 @@ def predict_box_from_points(
     """点选返回归一化外接框。"""
     if not points:
         raise ValueError("至少点一个前景点")
-    img = dataset_svc.get_image(image_id)
-    path = dataset_svc.image_file_path(img)
-    if not path.is_file():
-        raise FileNotFoundError("原图丢失")
 
-    with Image.open(path) as im:
-        w, h = im.size
-        arr = np.array(im.convert("RGB"))
-
+    arr, w, h = _load_rgb(image_id)
     model = _get_predictor()
     pts = [[float(p[0]), float(p[1])] for p in points]
     labs = [int(x) for x in (labels or [1] * len(pts))]
     if len(labs) < len(pts):
         labs = labs + [1] * (len(pts) - len(labs))
 
-    # ultralytics SAM: points 为像素坐标
     results = model.predict(
         source=arr,
         points=pts,
@@ -92,14 +101,11 @@ def predict_box_from_points(
         raise RuntimeError("SAM 未返回结果")
     r = results[0]
     score = 0.9
-    # 取掩码外接矩形
     if r.masks is not None and len(r.masks.data) > 0:
         mask = r.masks.data[0].cpu().numpy()
-        # mask 可能是模型尺寸，映射回原图
         ys, xs = np.where(mask > 0.5)
         if len(xs) == 0:
             raise RuntimeError("未分割到目标，请换个位置再点")
-        # masks 可能是 imgsz，需缩放
         mh, mw = mask.shape[-2:]
         scale_x = w / max(mw, 1)
         scale_y = h / max(mh, 1)
@@ -132,5 +138,8 @@ def predict_box_from_points(
 
 
 def prefetch_next(image_id: str) -> None:
-    """可选：后台预热（简化为空操作，避免过度复杂）。"""
-    return
+    """后台预热下一张图的 RGB 缓存，失败忽略。"""
+    try:
+        _load_rgb(image_id)
+    except Exception as exc:
+        logger.debug("SAM prefetch 跳过 %s: %s", image_id, exc)

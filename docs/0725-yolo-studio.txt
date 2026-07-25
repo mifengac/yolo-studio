@@ -1,0 +1,812 @@
+ ▐▛███▜▌   Claude Code v2.1.220
+▝▜█████▛▘  Opus 5 · Claude Pro
+  ▘▘ ▝▝    ~/project/yolo-studio/docs
+
+   Tackle your toughest work with Opus 5. Switch anytime with /model.
+  ⎿  SessionStart:startup hook error
+  ⎿  Failed with non-blocking status code: fatal: not a git repository (or any 
+     of the parent directories): .git
+
+❯ /model                                                                        
+  ⎿  Set model to Opus 5 and saved as your default for new sessions
+
+❯ # 任务:帮我设计一个图片打标签、训练yolo模型的web系统，用python fast api；#    
+  背景：我之前在我们内网（离线环境）通过用翘车头的图片训练了2个模型，具体你可以 
+  看bczj-classifier\models\0517_yolo26n_wheelie_multi-rider.pt和bczj-classifier 
+  \models\0517_yolo26s_wheelie_multi-rider.pt，这是用yolo26s和yolo26n训练的，但 
+  是之前是用labelimg这个项目打的标签，而且还要拿出外网去打，很麻烦，所以我写自  
+  己做一个打标签同时可以自己训练模型的web项目，你帮我设计下，另外打标签的话有没 
+  有更好的方法可以不用手打的；                                                  
+
+● 我先看看你现有的项目结构，了解下背景再动手设计。
+
+  Searched for 1 pattern, read 1 file, listed 2 directories, ran 4 shell commands (ctrl+o to expand)
+
+● 我把现状摸清了，先说一个重要发现，能帮你省掉一半工作量。
+
+  ---
+  一、你已经有半个轮子了
+
+  multi-rider/modules/training/ 里已经有一套能跑的标注+训练模块（Flask 版，约
+  3200 行）：
+
+  ┌───────────────────────────────────────┬─────────────────────────────────┐
+  │               已有能力                │              文件               │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 数据集管理、ZIP 导入、图片资产        │ dataset_service.py (638 行)     │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 模型自动预标注（含类别映射、批量）    │ auto_annotate_service.py (294   │
+  │                                       │ 行)                             │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 预标注后台任务                        │ auto_annotate_task_service.py   │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 训练任务（subprocess 调               │ train_task_service.py (849 行)  │
+  │ yolo、产物、报告）                    │                                 │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 模型注册、版本槽位、回滚              │ model_registry_service.py (401  │
+  │                                       │ 行)                             │
+  ├───────────────────────────────────────┼─────────────────────────────────┤
+  │ 34 个 HTTP 接口                       │ routes.py (856 行)              │
+  └───────────────────────────────────────┴─────────────────────────────────┘
+
+  而且 model/yolo/production/yolov8s-worldv2.pt 是 YOLO-World 
+  开放词表模型——这玩意儿就是"不用手打标签"的关键道具之一，你手里已经有了。
+
+  我的建议：新项目不要从零写，把这套业务逻辑移植 + 重构到 FastAPI（Flask 路由换
+  FastAPI 路由、加上真正好用的前端标注画布、补上下面说的几种自动标注手段）。工作
+  量从"两周"降到"三四天"。
+
+  ---
+  二、关于"不用手打标签"——有 7 条路，按性价比排序
+
+  1. 用你现有的模型预标注（最该先做，立刻见效）
+
+  你已经有 0517_yolo26s_wheelie_multi-rider.pt。新图先让它跑一遍，直接生成框，人
+  只做"改一改、删一删、点确认"。实测能省 70%~80%
+  的时间。你根本不存在冷启动问题。
+
+  2. 迭代闭环（整个系统的灵魂）
+
+  标 200 张 → 训一版新模型 → 用新模型预标下一批 500 张
+     → 预标越来越准 → 人越来越只需点"确认" → 再训 → ...
+  到后面基本就是"翻页 +
+  按确认键"。这个闭环要做进系统里：训练产物能一键设为"默认预标注模型"。
+
+  3. 开放词表零样本检测（新类别冷启动用）
+
+  YOLO-World / YOLOE：直接输入英文描述，比如 motorcycle with front wheel 
+  lifted、three people on one motorcycle，不用训练就出框。你 multi-rider
+  里已经有权重了。适合以后加新类别（比如"不戴头盔""改装排气"）时，第一批图连人工
+  都不用起头。
+
+  4. 视频跟踪传播（如果你有视频源，收益最大）
+
+  飙车炸街大概率有卡口视频。做法：视频抽帧 → 只标第 1 帧 → 用 ByteTrack/BoT-SORT
+  把框自动传播到后面几百帧。一段 10 秒视频（250 帧）人工只标 1~2
+  帧。这是数量级的差别。
+
+  5. SAM 点击辅助（手工兜底时用）
+
+  MobileSAM / SAM2：在物体上点一下，自动吐出精准框，不用拖拽拉框。对付预标注漏检
+  的图，比手拉快 3 倍。模型文件几十 MB，离线可用。
+
+  6. 主动学习排序（少标一半）
+
+  模型对哪些图"最没把握"（置信度在 0.3~0.6 之间、或同一物体两个类别打架），就把
+  这些图排到最前面让人标。模型已经很确定的图就别浪费人力了。同样标 500
+  张，效果能顶 1000 张。
+
+  7. 近重复图去重（别标废图）
+
+  连拍/视频抽帧会有大量几乎一样的图，标 100 张相似图不如标 10
+  张不同的。用感知哈希（pHash）或 CLIP
+  向量聚类，自动把近重复图折叠成一组，只标代表帧。
+
+  ▎ ⚠️ 离线约束：以上所有模型权重（YOLO-World、MobileSAM、CLIP）必须在外网机器上
+  ▎ 提前下好塞进 weights/ 目录，并且要关掉 ultralytics 的自动联网下载（它会偷偷
+  ▎ 下字体和权重，内网会卡住报错）。这一点我写进提示词里了。
+
+  ---
+  三、系统设计
+
+  技术栈（对齐你 bczj-classifier 的成熟做法，方便内网交付）：
+  - 后端 Python 3.12 + FastAPI + Uvicorn，SQLite（元数据）+
+  文件系统（图片/标签）
+  - 前端 Vue3 + 原生 Canvas 手写标注器，vendor 本地化、零 CDN
+  - 后台任务用线程池 + 任务表，不引 Celery/Redis（内网越简单越好）
+  - Docker 离线交付：有网机器 build → docker save → 内网 docker load
+
+  四个页面：
+  1. 数据集管理 — 建集、传 ZIP/图片/视频、类别定义、进度统计
+  2. 标注工作台（核心） — Canvas 画框、快捷键全覆盖、预标注结果审核、SAM
+  点选、复制上一张
+  3. 训练中心 — 选数据集/底模/参数 → 实时日志（SSE）+ loss/mAP 曲线
+  4. 模型仓库 — 版本列表、指标对比、一键发布为"预标注默认模型"（闭环）
+
+  数据真源规则：数据库存标注（一行一个框），YOLO 的 .txt
+  只在导出/训练时生成。避免两边打架。
+
+  标注器快捷键（好不好用全看这个）：
+  W 画框 · 1-9 切类别 · A/D 上下张 · Delete 删框 · Ctrl+Z 撤销 · 空格 拖动 ·
+  滚轮 缩放 · C 复制上一张标注 · Enter 确认本图 · 切图自动保存
+
+  ---
+  四、给执行 agent 的完整提示词
+
+  完整提示词我写到文件了，你直接把整个文件内容丢给执行的 agent 就行：
+
+● Write(~/project/20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Wrote 385 lines to ../../20260725_yolo_studio_设计与实现提示词.md
+       1 # YOLO Studio —— 图片标注 + 模型训练一体化 Web 平台（实现提示词
+         ）
+       3 > 本文件是一份**自包含的实现任务书**，交给编码 agent 后应能直接
+         开工，不需要再追问需求。
+       4 
+       6 
+       7 ## 一、背景
+       8 
+         ，需要识别两类目标：
+      10 - `wheelie` —— 翘车头
+     … +472 lines (ctrl+o to expand)
+
+● 提示词已写好：
+
+  /home/longshao/project/20260725_yolo_studio_设计与实现提示词.md
+
+  里面包含：背景痛点、必读的现有代码清单（含每个文件能复用什么）、技术栈硬约束、
+  完整目录结构、SQLite 建表 SQL、按 M1~M4
+  分阶段的接口清单与实现要点、离线交付要求、验收标准。接手的 agent
+  拿着它应该不用再追问。
+
+  ---
+  几个我替你做的判断，你过一眼
+
+  1. 端口用 5010，避开 bczj-classifier 的 5009。
+  2. 标注数据以数据库为唯一真源，.txt 只在训练/导出时生成。原 multi-rider 版本是
+  DB 和 txt 双写，容易对不上账。
+  3. 数据集划分必须按 group_key 分组（近重复图、同一段视频的帧不能一半进训练集一
+  半进验证集）。这是这类项目最常见的坑——不这么做，mAP
+  会虚高得离谱，模型上线就露馅。
+  4. 训练同时只允许跑一个，排队执行。内网机器显存有限。
+  5. 我没有引入 Celery/Redis，就用线程池 +
+  任务表。内网多一个中间件就多一份运维麻烦。
+
+  落地建议
+
+  别一口气全做。先做 M1 + M2 的①（标注工作台 + 用你现有的 0517_yolo26s
+  做预标注），这两块做完就能立刻替代
+  labelImg，而且不用再把图片带到外网——你最痛的点当场解决。M3 训练、M4
+  闭环可以第二轮再补。
+
+  一个需要你确认的事：内网训练机是有 GPU 还是纯 CPU？ 提示词里我写的是 device: 
+  "auto" 自动检测、两者都支持。但如果是纯 CPU，训 100 epoch
+  可能要跑一整夜，那训练页就得加上"预计耗时"提示和断点续训，免得用户以为卡死了。
+  你告诉我，我可以把这段补进提示词。
+
+✻ Churned for 5m 4s
+
+❯ 1. 这个项目是新项目，你直接帮我起个名然后再project里面新建一个文件夹，然后我  
+  会去GitHub新建一个项目，等下代码全部落到那个文件夹里面                        
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Write(~/project/yolo-studio/.gitignore)
+  ⎿  Wrote 27 lines to ../.gitignore
+      1 # 模型权重（体积大，不进仓库；按 docs/离线权重清单 手工放置）
+      2 weights/
+      3 *.pt
+      4 *.onnx
+      5 *.engine
+      6 
+      7 # 运行时数据（图片、标注库、训练产物）
+      8 data/
+      9 !data/.gitkeep
+     … +17 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● 文件夹建好了。
+
+  项目名：yolo-studio
+
+  选它的理由：见名知意（YOLO 的工作台），标注和训练两件事都罩得住，以后加视频、
+  分割也不用改名；短、全小写带连字符，GitHub 仓库名和 Docker 镜像名可以直接用。
+
+  ▎ 如果你想更贴业务，备选 bczj-studio（飙车炸街）——但那样以后拿去做别的场景就名
+  ▎ 不副实了。要改现在改最便宜，说一声就行。
+
+  已建好的结构
+
+  ~/project/yolo-studio/
+  ├── .gitignore          ← 已配好，重点挡住 *.pt 和 data/
+  ├── app/                后端
+  │   ├── api/            接口层
+  │   ├── services/       业务逻辑
+  │   └── infer/          模型加载与推理
+  ├── web/                前端（js / css / vendor 本地依赖）
+  ├── data/               运行时数据（图片、SQLite、训练产物）
+  ├── weights/            预置模型权重
+  ├── docs/
+  │   └── 20260725_yolo_studio_设计与实现提示词.md   ← 提示词已挪进来
+  └── scripts/            冒烟测试等
+
+  .gitignore 里两条最要紧的，我提前挡住了：
+
+  - weights/ 和 *.pt —— 你那个 0517_yolo26s 有 20MB，误推上 GitHub
+  会很难受（而且是内网训的业务模型，不该进公开仓库）
+  - data/ —— 里面全是抓拍图片，绝对不能推到 GitHub，这是数据合规问题
+
+  data/ 和 web/vendor/ 里放了 .gitkeep 占位，保证空目录也能进仓库。
+
+  下一步
+
+  你去 GitHub 建仓库后，在这个目录里执行（注意：不要在 ~/project 顶层跑
+  git，会把你其他仓库全套乱）：
+
+  cd ~/project/yolo-studio
+  git init
+  git remote add origin <你的仓库地址>
+
+  然后把 docs/20260725_yolo_studio_设计与实现提示词.md 整份丢给执行的 agent
+  就能开工。
+
+  还有个问题等你回答：内网训练机是有 GPU 还是纯 CPU？
+  影响训练页要不要做"预计耗时 + 断点续训"，你说了我补进提示词。
+
+✻ Worked for 46s
+
+❯ 内网是纯cpu，e5 2697v3，32GB内存，无GPU，系统是centos                         
+  stream10，但是我一般用docker部署项目，端口的话用5016，你按照这个设计，        
+
+● 纯 CPU 是个硬约束，会显著改变训练部分的设计。我先给你交个实底，再改设计。
+
+  先说实话：E5-2697 v3 训练 YOLO 有多慢
+
+  这颗是 2014 年的 14 核 28 线程 Haswell，多核还行但单核弱，没有 GPU
+  就只能靠核数堆。我按你的机器估算（假设 1000 张训练图）：
+
+  ┌─────────────────────────────────┬────────────┬─────────────────┐
+  │              配置               │  单 epoch  │   跑 50 epoch   │
+  ├─────────────────────────────────┼────────────┼─────────────────┤
+  │ yolo26s + 640px（你现在的配置） │ 20~35 分钟 │ 17~29 小时 ❌   │
+  ├─────────────────────────────────┼────────────┼─────────────────┤
+  │ yolo26n + 640px                 │ 8~15 分钟  │ 7~12 小时 ⚠️    │
+  ├─────────────────────────────────┼────────────┼─────────────────┤
+  │ yolo26n + 416px                 │ 4~7 分钟   │ 3.5~6 小时 ✅   │
+  ├─────────────────────────────────┼────────────┼─────────────────┤
+  │ yolo26n + 416px + 冻结主干      │ 2~4 分钟   │ 2~3.5 小时 ✅✅ │
+  └─────────────────────────────────┴────────────┴─────────────────┘
+
+  三个能救命的招（我会写进设计）：
+
+  1. 不要从 COCO 预训练从头开始，从你已有的模型接着训。你手里的
+  0517_yolo26s_wheelie_multi-rider.pt 已经认识"翘车头"了，新数据只是让它更准 ——
+  这种微调 20~30 个 epoch 就够，不用 100 个。时间直接砍掉 70%。
+  2. 冻结主干（freeze=10），只训检测头。反向传播的计算量少一半，而且你数据量不大
+  时效果反而更稳。
+  3. 图片缓存进内存（cache='ram'）。你有 32GB，1000 张 416px 图才占 500MB
+  左右，省掉每轮反复读盘解码，白捡 20~30% 速度。
+
+  另外一个大头：预标注和推理用 OpenVINO 加速。Intel CPU 上把模型导出成 OpenVINO
+  格式，推理能快 2~3 倍。预标注 1000 张图从 5 分钟降到 2 分钟。训练还得用
+  PyTorch，但推理这块必须上。
+
+  我现在把这些改进提示词。
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Added 3 lines, removed 2 lines
+      60  |---|---|---|
+      61  | 后端 | Python 3.12 + FastAPI + Uvicorn | 与现有项目一致 |
+      62  | 数据库 | SQLite（开启 WAL） | 单文件、免运维、内网友好 |
+      63 -| 推理/训练 | ultralytics >= 8.3 + PyTorch | 自动检测 CUDA，无 
+         -GPU 时退回 CPU |                                               
+      63 +| 训练 | ultralytics >= 8.3 + **PyTorch CPU 版** | 见第四章之二
+         +，纯 CPU，必须装 CPU-only torch |                              
+      64 +| 推理 | ultralytics + **OpenVINO Runtime** | Intel CPU 上比 Py
+         +Torch 快 2~3 倍，预标注必须走这条 |                            
+      65  | 前端 | Vue 3（global build）+ 原生 Canvas | **禁止任何 CDN**
+          ，全部 vendor 本地化 |
+      66  | 图表 | ECharts（本地 vendor） | 训练曲线 |
+      67  | 异步任务 | 进程内 ThreadPoolExecutor + 任务表 | **禁止引入 Ce
+          lery / Redis / RabbitMQ** |
+      67 -| 部署 | Docker + docker-compose，端口 **5010** | 避开 bczj-cla
+         -ssifier 的 5009 |                                              
+      68 +| 部署 | Docker + docker-compose，端口 **5016** | 用户指定 |   
+      69  
+      70  **离线硬约束（必须逐条落实，否则内网直接跑不起来）**：
+      71  1. 设置环境变量 `YOLO_OFFLINE=1`、`HF_HUB_OFFLINE=1`、`TRANSFOR
+          MERS_OFFLINE=1`
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Added 171 lines
+       74  4. 前端所有 js/css/字体放 `web/vendor/`，HTML 中不得出现任何 `
+           http(s)://` 外链
+       75  5. `requirements.txt` 之外提供 `wheels/` 离线安装目录说明
+       76  
+       77 +## 四之二、★ 目标机器是纯 CPU，这一章是本项目最关键的约束     
+       78 +                                                              
+       79 +### 实际部署环境                                              
+       80 +                                                              
+       81 +| 项 | 值 |                                                   
+       82 +|---|---|                                                     
+       83 +| CPU | Intel Xeon **E5-2697 v3**，14 核 28 线程，Haswell 架构
+          +（2014），支持 AVX2、**不支持 AVX-512** |                     
+       84 +| 内存 | 32 GB |                                              
+       85 +| GPU | **无，一块都没有** |                                  
+       86 +| 系统 | CentOS Stream 10 |                                   
+       87 +| 部署方式 | Docker |                                         
+       88 +| 端口 | **5016** |                                           
+       89 +| 网络 | 完全离线 |                                           
+       90 +                                                              
+       91 +### 必须做的事（漏一条就会出大问题）                          
+       92 +                                                              
+       93 +**1. 装 CPU-only 版 PyTorch，绝对不要装默认的 CUDA 版**       
+       94 +                                                              
+       95 +默认 `pip install torch` 会拉 2.5 GB 的 CUDA 版本，在这台机器 
+          +上一点用没有，还会把 Docker 镜像撑到 6 GB+，拷进内网非常痛苦。
+          +必须：                                                        
+       96 +                                                              
+       97 +```                                                           
+       98 +--extra-index-url https://download.pytorch.org/whl/cpu        
+       99 +torch==2.5.1+cpu                                              
+      100 +torchvision==0.20.1+cpu                                       
+      101 +```                                                           
+      102 +镜像能从 6 GB 降到 1.5 GB 左右。构建后用 `python -c "import to
+          +rch; print(torch.__version__)"` 确认输出带 `+cpu`。           
+      103 +                                                              
+      104 +**2. 线程数要调对，用物理核数而不是逻辑核数**                 
+      105 +                                                              
+      106 +超线程对 YOLO 训练往往是负优化。统一在 `config.py` 里设置，且 
+          +允许 `.env` 覆盖：                                            
+      107 +                                                              
+      108 +```python                                                     
+      109 +CPU_THREADS = int(os.getenv("CPU_THREADS", "14"))   # 物理核数
+      110 +os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))    
+      111 +os.environ.setdefault("MKL_NUM_THREADS", str(CPU_THREADS))    
+      112 +torch.set_num_threads(CPU_THREADS)                            
+      113 +```                                                           
+      114 +注意：这几个环境变量**必须在 import torch 之前设置**才生效，所
+          +以要放在 `config.py` 顶部，且 `main.py` 第一行就 import config
+          +。                                                            
+      115 +                                                              
+      116 +**3. 所有涉及模型的调用强制 `device='cpu'`、`amp=False`**     
+      117 +                                                              
+      118 +CPU 上没有混合精度，`amp=True` 会触发一次没必要的 GPU 检查甚至
+          +联网下载检测脚本（离线环境直接卡住）。训练、验证、推理全部显式
+          +传 `device='cpu', amp=False`。                                
+      119 +                                                              
+      120 +**4. 预标注/推理走 OpenVINO，不要用 PyTorch 直接推**          
+      121 +                                                              
+      122 +模型注册进模型仓库时，后台自动导出一份 OpenVINO 格式：        
+      123 +```python                                                     
+      124 +model.export(format='openvino', imgsz=<训练时的 imgsz>, half=F
+          +alse)                                                         
+      125 +```                                                           
+      126 +产物存到 `data/models/<model_id>_openvino_model/`。预标注时优 
+          +先加载 OpenVINO 版本，找不到才退回 `.pt`。这一步能让预标注速度
+          +快 2~3 倍，是纯 CPU 环境下体感差别最大的优化。                
+      127 +                                                              
+      128 +导出失败要能优雅降级（记日志 + 继续用 .pt），不能因为导出失败 
+          +就让模型不可用。                                              
+      129 +                                                              
+      130 +**5. 内存缓存策略要按数据量自动决定**                         
+      131 +                                                              
+      132 +32 GB 内存，训练时把图片缓存进内存能省掉反复读盘解码，快 20~30
+          +%。但数据量大了会 OOM。规则：                                 
+      133 +                                                              
+      134 +```                                                           
+      135 +预估内存 = 图片数 × imgsz × imgsz × 3 bytes × 1.2             
+      136 +预估 < 8 GB  → cache='ram'                                    
+      137 +8~16 GB      → cache='disk'                                   
+      138 +> 16 GB      → cache=False                                    
+      139 +```                                                           
+      140 +把这个判断写成 `train_svc.py` 里的函数，并把选择结果打进训练日
+          +志，让用户知道系统做了什么决定。                              
+      141 +                                                              
+      142 +**6. DataLoader workers 与 Docker 共享内存**                  
+      143 +                                                              
+      144 +`workers=8`（不要设成 14，数据加载抢了计算的核反而慢）。同时 d
+          +ocker-compose 必须设 `shm_size: '2gb'`，否则多 worker 的 DataL
+          +oader 会报 `bus error` / `DataLoader worker killed`——这是 Dock
+          +er 里跑 PyTorch 最常见的坑。                                  
+      145 +                                                              
+      146 +### 训练默认参数（针对这台机器调过，不要照抄 GPU 时代的默认值 
+          +）                                                            
+      147 +                                                              
+      148 +| 参数 | 默认值 | 理由 |                                      
+      149 +|---|---|---|                                                 
+      150 +| `base_model` | **yolo26n**（微） | s 版在这台机器上慢 3 倍，
+          +不值 |                                                        
+      151 +| `imgsz` | **416** | 640 的计算量是 416 的 2.4 倍；飙车炸街目
+          +标在画面里不算小，416 够用 |                                  
+      152 +| `epochs` | **40** | 配合早停，基本 25~35 轮就收敛 |         
+      153 +| `batch` | **16** | 内存够，再大对 CPU 提速有限 |            
+      154 +| `patience` | **10** | 早停，别浪费几小时跑无效轮次 |        
+      155 +| `workers` | **8** | 留核给计算 |                            
+      156 +| `device` | `cpu` | 固定 |                                   
+      157 +| `amp` | `False` | 固定 |                                    
+      158 +| `freeze` | **10**（可关） | 冻结主干只训头部，省 40~50% 时间
+          + |                                                            
+      159 +| `cache` | 自动 | 按上面的规则算 |                           
+      160 +                                                              
+      161 +### ★ 从已有模型微调（本项目最重要的省时手段）                
+      162 +                                                              
+      163 +用户手上已经有 `0517_yolo26s_wheelie_multi-rider.pt`，它已经认
+          +识"翘车头"和"多人骑车"了。新数据不该从 COCO 预训练权重从头开始
+          +学，而应该**在这个模型基础上接着训**。                        
+      164 +                                                              
+      165 +界面上"底模"选择要分成两组，并且**默认选中第二组**：          
+      166 +                                                              
+      167 +- **从零开始**：`yolo26n.pt` / `yolo26s.pt`（COCO 预训练）→ 需
+          +要 40+ epoch                                                  
+      168 +- **在已有模型上继续训练（推荐）**：列出模型仓库里所有已注册模
+          +型 → 只需 **15~25 epoch**                                     
+      169 +                                                              
+      170 +选择第二组时，前端要给出提示：                                
+      171 +> "已选择在现有模型基础上微调，训练轮次会自动降到 20 轮，预计 
+          +耗时比从零训练少 60%。"                                       
+      172 +                                                              
+      173 +同时后端要校验：底模的类别列表必须和数据集类别兼容（数量与顺序
+          +一致），不一致要报人话错误，例如                              
+      174 +> "这个模型认识的是 [翘车头, 多人骑车]，但你的数据集有 3 个类 
+          +别，类别对不上，不能在它基础上继续训练。请改用从零开始的底模。
+          +"                                                             
+      175 +                                                              
+      176 +### ★ 训练耗时预估器（必做，否则用户会以为系统卡死）          
+      177 +                                                              
+      178 +CPU 训练动辄几小时，界面上**必须**让用户提前知道要等多久。    
+      179 +                                                              
+      180 +**两段式预估**：                                              
+      181 +                                                              
+      182 +1. **提交前粗估**：参数表单里任何一项改变，前端实时调 `POST /a
+          +pi/train/estimate`，后端按经验公式返回预计耗时。公式基线（E5-2
+          +697 v3，14 线程，1000 张图，yolo26n，imgsz 640，不冻结 = **10 
+          +分钟/epoch**），再按下列系数缩放：                            
+      183 +   - 图片数：线性                                             
+      184 +   - imgsz：`(imgsz/640)²`                                    
+      185 +   - 模型：n=1.0，s=3.0，m=7.0                                
+      186 +   - freeze=10：×0.55                                         
+      187 +   - cache='ram'：×0.78                                       
+      188 +                                                              
+      189 +2. **第一轮实测后校准**：第 1 个 epoch 跑完，用实测秒数 × 剩余
+          +轮数替换掉估算值，前端显示"预计还需 3 小时 12 分（已根据实测校
+          +准）"。                                                       
+      190 +                                                              
+      191 +**红线警告**：预估超过 **12 小时**，提交按钮旁边显示红色警告并
+          +给出具体的降参建议：                                          
+      192 +> "⚠️ 预计需要 31 小时。建议：把底模从 yolo26s 换成 yolo26n（省
+          + 20 小时），或把图片尺寸从 640 降到 416（再省 6 小时）。"     
+      193 +                                                              
+      194 +超过 24 小时则默认禁用提交按钮，需要用户勾选"我知道会很久，仍 
+          +然继续"才放行。                                               
+      195 +                                                              
+      196 +### ★ 断点续训与容器重启恢复（必做）                          
+      197 +                                                              
+      198 +一次训练要跑几小时甚至跨夜，容器重启、误操作、断电都可能中断。
+      199 +                                                              
+      200 +1. `train_job` 表增加字段：`last_epoch`（已完成轮次）、`resume
+          +_from`（last.pt 路径）、`eta_seconds`（最新预估剩余秒数）     
+      201 +2. 训练进程用 subprocess 启动，PID 记进任务表                 
+      202 +3. **应用启动时**扫描所有 `status='running'` 的训练任务：进程 
+          +已不在 → 状态改为 `interrupted`，并在界面上给一个醒目的「继续 
+          +训练」按钮                                                    
+      203 +4. 「继续训练」调用 ultralytics 的 resume：                   
+      204 +   ```python                                                  
+      205 +   YOLO(f"{run_dir}/weights/last.pt").train(resume=True)      
+      206 +   ```                                                        
+      207 +5. docker-compose 设 `restart: unless-stopped`，但**不要**让容
+          +器自动重跑训练——必须由用户点击「继续训练」，避免死循环重启把机
+          +器跑垮                                                        
+      208 +                                                              
+      209 +### 部署要点（CentOS Stream 10 + Docker）                     
+      210 +                                                              
+      211 +1. **SELinux**：CentOS 默认 enforcing，volume 挂载必须加 `:z` 
+          +，否则容器读不到 `data/` 和 `weights/`：                      
+      212 +   ```yaml                                                    
+      213 +   volumes:                                                   
+      214 +     - ./data:/app/data:z                                     
+      215 +     - ./weights:/app/weights:z                               
+      216 +   ```                                                        
+      217 +2. **防火墙**：README 里写明放行端口：                        
+      218 +   ```bash                                                    
+      219 +   firewall-cmd --permanent --add-port=5016/tcp && firewall-cm
+          +d --reload                                                    
+      220 +   ```                                                        
+      221 +3. **docker-compose 关键配置**：                              
+      222 +   ```yaml                                                    
+      223 +   services:                                                  
+      224 +     yolo-studio:                                             
+      225 +       ports: ["5016:5016"]                                   
+      226 +       shm_size: '2gb'          # 必须，否则 DataLoader 崩    
+      227 +       environment:                                           
+      228 +         - CPU_THREADS=14                                     
+      229 +         - OMP_NUM_THREADS=14                                 
+      230 +         - YOLO_OFFLINE=1                                     
+      231 +       restart: unless-stopped                                
+      232 +   ```                                                        
+      233 +4. **不要限制 cpus**：训练就指望这 14 个核，别用 `cpus: "4"`  
+          +之类的限制把自己捆住                                          
+      234 +5. **基础镜像**用 `python:3.12-slim`（Debian 系），不必跟宿主 
+          +机 CentOS 保持一致；需要 `libgl1`、`libglib2.0-0` 给 OpenCV   
+      235 +6. 交付流程照搬 `bczj-classifier/README.md`：有网机器 build → 
+          +`docker save` → 拷贝 → 内网 `docker load` → `docker compose up
+          + -d`                                                          
+      236 +                                                              
+      237 +### 其他模型在 CPU 上的可用性（实现前先掂量）                 
+      238 +                                                              
+      239 +| 能力 | CPU 上的表现 | 结论 |                                
+      240 +|---|---|---|                                                 
+      241 +| yolo26n 预标注（OpenVINO） | 约 30~60 ms/张 | ✅ 放心用 |   
+      242 +| yolo26s 预标注（OpenVINO） | 约 100~180 ms/张 | ✅ 可用 |   
+      243 +| YOLO-World 开放词表 | 约 0.6~1.2 s/张 | ⚠️ 只能小批量试，UI 
+          +上默认限制单次 ≤ 200 张，并明确提示耗时 |                     
+      244 +| **MobileSAM** 点选 | 编码约 1.5~3 s/张，之后每次点选 < 100 m
+          +s | ✅ 可用，但**必须做 image embedding 的 LRU 缓存**（缓存 8 
+          +张），并在切图时后台预编码下一张 |                            
+      245 +| 原版 SAM / SAM2-large | 单张 10 s 以上 | ❌ **禁止使用**，只
+          +用 MobileSAM |                                                
+      246 +| 视频跟踪传播 | 约 3~8 帧/秒 | ⚠️ 单次任务最多 300 帧，超出要
+          +分批，并显示进度 |                                            
+      247 +                                                              
+      248  ## 五、目录结构
+      249  
+      250  ```
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)  ⎿  Added 19 lines, removed 11 lines
+      480  ### M3 —— 训练
+      481  
+      482  ```
+      483 +POST /api/train/estimate         ★ 试算耗时（参数一变前端就调 
+          +，见第四章之二）                                              
+      484  POST /api/train                  创建训练任务
+      484 -body: { dataset_id, base_model: "weights/yolo26s.pt",         
+      485 -        epochs: 100, imgsz: 640, batch: 16, device: "auto",   
+      486 -        val_ratio: 0.2, patience: 20, only_confirmed: true,   
+      485 +body: { dataset_id,                                           
+      486 +        base_model: "weights/yolo26n.pt",   -- 或模型仓库里已 
+          +有模型的 id（微调模式）                                       
+      487 +        epochs: 40, imgsz: 416, batch: 16,                    
+      488 +        val_ratio: 0.2, patience: 10, only_confirmed: true,   
+      489 +        freeze: 10, workers: 8,                               
+      490          augment_preset: "default" | "strong" }
+      488 -GET  /api/train/{job_id}         状态 + 指标                  
+      491 +        -- device 固定 cpu、amp 固定 False、cache 自动判定，均
+          +不由前端传入                                                  
+      492 +GET  /api/train/{job_id}         状态 + 指标 + last_epoch + et
+          +a_seconds                                                     
+      493  GET  /api/train/{job_id}/logs    ★ SSE 实时日志流
+      494  GET  /api/train/{job_id}/metrics 解析 results.csv 返回曲线数据
+           （box_loss/cls_loss/mAP50/mAP50-95）
+      495  POST /api/train/{job_id}/cancel  终止（kill 子进程，任务置 can
+           celed）
+      492 -POST /api/train/{job_id}/publish 产物注册进模型仓库           
+      496 +POST /api/train/{job_id}/resume  ★ 断点续训（从 last.pt 继续）
+      497 +POST /api/train/{job_id}/publish 产物注册进模型仓库（同时后台 
+          +导出 OpenVINO 版本）                                          
+      498  GET  /api/train/{job_id}/artifacts/{filename}   下载 best.pt /
+            混淆矩阵 / PR 曲线图
+      499  ```
+      500  
+     ...
+      502  - 训练前由 `export_svc.py` 生成标准 YOLO 目录（`images/train`
+           、`images/val`、`labels/train`、`labels/val`）+ `data.yaml`
+      503  - **划分必须按 `group_key` 分组划分**，保证近重复图/同一视频的
+           帧不会同时落在 train 和 val（否则 mAP 虚高，是这类项目最常见的
+           坑）
+      504  - `only_confirmed=true` 时只用 `review_status='confirmed'` 的
+           图
+      500 -- 训练开始前校验：类别数 > 0、每个类别至少 10 个框、train/val 
+          -都非空，不满足直接报错并给出人话提示                          
+      501 -- subprocess 调用（**跨平台，Linux 优先，不要硬编码 yolo.exe**
+          -）：                                                          
+      505 +- 训练开始前校验：类别数 > 0、每个类别至少 10 个框、train/val 
+          +都非空，不满足直接报错并给出人话提示；微调模式还要校验底模类别
+          +与数据集类别兼容                                              
+      506 +- subprocess 调用（**Linux 优先，绝对不要硬编码 `yolo.exe`**，
+          +原 multi-rider 的 `_resolve_yolo_executable()` 是 Windows 专用
+          +的，必须重写）：                                              
+      507    ```python
+      503 -  [sys.executable, "-m", "ultralytics", "detect", "train", f"d
+          -ata={yaml}", ...]                                             
+      508 +  [sys.executable, "-m", "ultralytics", "detect", "train",    
+      509 +   f"data={yaml}", "device=cpu", "amp=False", ...]            
+      510    ```
+      505 -  stdout/stderr 重定向到 `runs/<job_id>/train.log`            
+      511 +  stdout/stderr 重定向到 `runs/<job_id>/train.log`，PID 记进任
+          +务表                                                          
+      512  - SSE 接口 tail 该日志文件推给前端
+      507 -- 训练结束自动跑一次 val，把 mAP50 / mAP50-95 / precision / re
+          -call 存进 `train_job.metrics`                                 
+      508 -- 前端训练页：参数表单 + 实时日志黑框 + ECharts 双轴曲线（loss
+          - 下降 / mAP 上升）                                            
+      513 +- **每个 epoch 结束时**从日志解析出已完成轮次，更新 `last_epoc
+          +h` 与 `eta_seconds`（第 1 轮之后用实测速度校准预估）          
+      514 +- 训练结束自动跑一次 val（`device='cpu'`），把 mAP50 / mAP50-9
+          +5 / precision / recall 存进 `train_job.metrics`               
+      515 +- 前端训练页：参数表单（带实时耗时预估）+ **醒目的进度条与剩余
+          +时间** + 实时日志黑框 + ECharts 双轴曲线（loss 下降 / mAP 上升
+          +）                                                            
+      516 +- 因为一次训练可能跨夜，训练页要能关掉浏览器再回来看；任务全部
+          +状态持久化在数据库，不依赖前端连接                            
+      517  
+      518  ### M4 —— 模型仓库与闭环
+      519  
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Added 11 lines, removed 4 lines
+      534  2. 单机并发按 3~5 人使用设计；SQLite 开启 WAL，写操作加锁
+      535  3. 图片上传单次上限 500 MB，ZIP 内单文件校验，防目录穿越（`..`
+            路径）
+      536  4. 缩略图统一 320px 宽，懒生成并缓存
+      537 -5. 训练任务同一时刻**只允许一个在跑**（显存/CPU 限制），排队执
+          -行                                                            
+      537 +5. 训练任务同一时刻**只允许一个在跑**（14 核全给它，跑两个只会
+          +互相拖慢），排队执行；训练进行中时，预标注/跟踪等重 CPU 任务也
+          +要排队等待，并在界面上提示"正在训练模型，其他任务已排队"      
+      538  6. 所有接口有明确的 Pydantic 请求/响应模型，自动生成的 `/docs`
+            可用
+      539  7. 日志分级输出到 `data/logs/app.log`，按天切割
+      540 +8. **纯 CPU 环境下，任何超过 10 秒的操作都必须有进度反馈**，不
+          +允许出现前端转圈没有任何信息的情况                            
+      541  
+      542  ## 九、交付物
+      543  
+      544  1. 完整可运行的 `~/project/yolo-studio/` 项目
+      544 -2. `README.md`：功能说明、本地开发、Docker 离线交付步骤（参照 
+          -`bczj-classifier/README.md` 的组织方式）                      
+      545 -3. `Dockerfile` + `docker-compose.yml`，端口 5010，`data/` 与 
+          -`weights/` 用 volume 挂载                                     
+      545 +2. `README.md`：功能说明、本地开发、Docker 离线交付步骤（参照 
+          +`bczj-classifier/README.md` 的组织方式），**必须包含 CentOS St
+          +ream 10 上的 SELinux 与防火墙说明**                           
+      546 +3. `Dockerfile` + `docker-compose.yml`，端口 **5016**，`shm_si
+          +ze: 2gb`，`data/` 与 `weights/` 用 volume 挂载并带 `:z`       
+      547  4. **`docs/20260725_离线权重清单.md`**：列出所有需要在外网提前
+           下载的权重文件名、下载地址、文件大小、放置路径，方便用户一次性
+           备齐带进内网
+      547 -5. 一个冒烟测试脚本 `scripts/smoke_test.py`：建数据集 → 导 5  
+          -张图 → 预标注 → 存标注 → 导出 → 训 2 epoch → 校验产物存在     
+      548 +5. **`docs/20260725_CPU训练调优说明.md`**：给用户看的大白话文 
+          +档，说明为什么默认用 yolo26n + 416、什么时候该微调什么时候该从
+          +零训、一次训练大概要等多久、内存不够怎么办                    
+      549 +6. 一个冒烟测试脚本 `scripts/smoke_test.py`：建数据集 → 导 5  
+          +张图 → 预标注 → 存标注 → 导出 → 训 2 epoch（imgsz=320 保证几分
+          +钟内跑完）→ 校验产物存在 → 导出 OpenVINO 成功                 
+      550  
+      551  ## 十、验收标准
+      552  
+      553  | 项 | 标准 |
+      554  |---|---|
+      555  | 离线 | `docker run --network none` 启动后，全部功能（含标注
+           、预标注、训练）正常，无任何联网请求 |
+      556 +| **CPU-only** | 容器内 `python -c "import torch;print(torch._
+          +_version__)"` 输出必须带 `+cpu`；镜像体积 < 2 GB |            
+      557 +| **线程** | 训练时 `top` 能看到进程占用 ~1400% CPU（14 核吃满
+          +），不是只用 1 个核 |                                         
+      558 +| **预估** | 训练提交前显示的预计耗时，与实际耗时误差在 ±30%  
+          +以内 |                                                        
+      559 +| **续训** | 训练跑到一半 `docker compose restart`，重启后任务
+          +显示"已中断"，点「继续训练」能从断点接着跑完 |                
+      560 +| **OpenVINO** | 同一批 200 张图，OpenVINO 预标注耗时明显低于 
+          +PyTorch 直推（至少快 1.5 倍），且两者检测结果框数一致（允许 ±5
+          +%） |                                                         
+      561  | 标注效率 | 500 张图，先跑预标注，人工审核确认全部完成 ≤ 60 
+           分钟 |
+      562  | 训练 | 能在界面上完成一次完整训练，实时看到日志与曲线，产物 
+           best.pt 可下载并注册 |
+      563  | 闭环 | 新训练的模型能设为默认预标注模型，下一批预标注确实调
+           用了它 |
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Added 8 lines, removed 6 lines
+      290  │   ├── app.db
+      291  │   ├── datasets/<ds_id>/{images,thumbs,exports}
+      292  │   ├── runs/<job_id>/          # 训练输出
+      293 -│   └── models/                 # 已注册模型副本              
+      293 +│   ├── models/                 # 已注册模型副本（.pt）       
+      294 +│   └── models/<id>_openvino_model/   # 自动导出的 OpenVINO 版
+          +本，预标注优先用它                                            
+      295  ├── weights/                    # 预置权重（不进 git）
+      295 -│   ├── yolo26n.pt              # 训练底模                    
+      296 -│   ├── yolo26s.pt                                            
+      297 -│   ├── 0517_yolo26s_wheelie_multi-rider.pt   # 从 bczj-classi
+          -fier 拷入，做初始预标注                                       
+      298 -│   ├── yolov8s-worldv2.pt      # 从 multi-rider 拷入，开放词 
+          -表                                                            
+      299 -│   └── mobile_sam.pt           # SAM 点选辅助                
+      296 +│   ├── yolo26n.pt              # ★ 默认训练底模（CPU 环境首选
+          +）                                                            
+      297 +│   ├── yolo26s.pt              # 备选，CPU 上慢 3 倍，非必要 
+          +不用                                                          
+      298 +│   ├── 0517_yolo26s_wheelie_multi-rider.pt   # 从 bczj-classi
+          +fier 拷入，冷启动预标注 + 微调底模                            
+      299 +│   ├── 0517_yolo26n_wheelie_multi-rider.pt   # 同上，微版    
+      300 +│   ├── yolov8s-worldv2.pt      # 从 multi-rider 拷入，开放词 
+          +表零样本                                                      
+      301 +│   └── mobile_sam.pt           # SAM 点选辅助（★ 只用 MobileS
+          +AM，原版 SAM 在 CPU 上不可用）                                
+      302  ├── requirements.txt
+      303  ├── .env.example
+      304  ├── Dockerfile
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Update(20260725_yolo_studio_设计与实现提示词.md)
+  ⎿  Added 2 lines, removed 1 line
+      27  3. **多种自动标注手段**，最大程度减少手工画框
+      28  4. YOLO 模型训练（实时日志 + 指标曲线）
+      29  5. 模型仓库与发布，训练产物可一键设为"默认预标注模型"，形成 `标
+          注 → 训练 → 更好的预标注 → 更省力的标注` 迭代闭环
+      30 -6. 全程**离线可用**，Docker 方式交付内网                       
+      30 +6. 全程**离线可用**，Docker 方式交付内网，端口 **5016**        
+      31 +7. **在一台没有 GPU 的老服务器上跑得动** —— 这是本项目最强的约 
+         +束，动手前必须先读完「第四章之二」                             
+      32  
+      33  ## 三、必须先读的现有代码（重要：不要从零造轮子）
+      34  
+
+  Wrote 2 memories (ctrl+o to expand)
+
+● 提示词已按纯 CPU 环境重写，文件在
+  ~/project/yolo-studio/docs/20260725_yolo_studio_设计与实现提示词.md（574
+  行）。
+
+  主要改了什么
+
+  新增了一整章「四之二：目标机器是纯 CPU」，这是全文最长也最要紧的一章，里面 6
+  条硬性要求：
+
+  1. 必须装 CPU-only 版 PyTorch。默认 pip install torch 会拉 2.5GB 的 CUDA
+  版，在你机器上一点用没有，还会把镜像撑到 6GB —— 拷进内网够你受的。装 +cpu
+  版镜像能压到 1.5GB。
+  2. 线程数设 14（物理核）而不是 28。超线程对 YOLO
+  训练往往是负优化。而且这几个环境变量必须在 import torch 
+  之前设，我在提示词里特意点了这个坑。
+  3. 所有模型调用强制 device='cpu'、amp=False。CPU 没有混合精度，amp=True
+  会触发一次多余的 GPU 检查甚至联网下载，离线环境直接卡死。
+  4. 预标注走 OpenVINO。模型注册时后台自动导出一份，推理快 2~3 倍。
+  5. 图片缓存按数据量自动决定 ram/disk/关闭，别一股脑塞内存把 32G 撑爆。
+  6. docker-compose 必须设 shm_size: 2gb，否则 DataLoader 多进程会莫名 bus error
+  —— 这是 Docker 里跑 PyTorch 最常见的坑，不设必踩。
+
+  训练默认参数全换了：yolo26n + 416px + 40 epoch + freeze=10 +
+  patience=10（原来是 yolo26s + 640 + 100
+  epoch，那套配置在你机器上要跑一天多）。
+
+  新增两个必做功能：
+
+  - 耗时预估器 —— 参数一改就实时算，第 1 个 epoch 跑完用实测校准。超 12
+  小时红色警告并给出具体降参建议，超 24 小时要勾选确认才能提交。CPU
+  训练不给预估，用户三小时后必然以为系统死了。
+  - 断点续训 + 容器重启恢复 —— 应用启动时扫描"还在 running 但进程已经没了"的任务
+  ，标记为已中断，给个「继续训练」按钮。跨夜训练遇上重启不至于全白跑。同时
+  restart: unless-stopped 但不自动重跑训练，避免死循环把机器跑垮。
+
+  部署部分补了 CentOS 特有的两个坑：SELinux 默认 enforcing，volume 挂载不加 :z
+  容器读不到 data/；firewalld 要手动放行 5016。
+
+  一个我给你标了红线的建议
+
+  提示词里我把"在已有模型上继续训练"设成了训练页的默认选项，而不是从 COCO
+  从头训。
+
+  你手上 0517_yolo26s 已经认识翘车头了，新数据只是让它更准 —— 这种微调 20 
+  轮就够，从零训要 40+ 轮。在没有 GPU 的机器上，这一个选择就是"睡一觉起来训好了"
+  和 "等两天" 的区别。
+
+  ---
+  端口 5016、CentOS、Docker 都已经落进文档。目录建好了，.gitignore
+  也配好了（weights/、*.pt、data/ 都挡住了 —— 抓拍图片千万别推上 GitHub）。
+
+  你去 GitHub 建好仓库后，在 ~/project/yolo-studio/ 里面 git init，然后把 docs/
+  下那份提示词整份丢给执行的 agent 就能开工。
+
+✻ Churned for 6m 14s

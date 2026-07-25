@@ -1,4 +1,4 @@
-"""pHash 近重复检测。"""
+"""近重复检测（aHash 平均哈希；非 pHash，大图集请分批）。"""
 
 from __future__ import annotations
 
