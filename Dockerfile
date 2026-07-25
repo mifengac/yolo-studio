@@ -30,12 +30,14 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 # 与本地实测一致：torch 2.13.0+cpu / torchvision 0.28.0+cpu / ultralytics 8.4.105
-# ultralytics 会拉完整 opencv-python，再卸掉只留 headless，约省 100MB+（失败则保留双份）
+# ultralytics 会拉完整 opencv-python；卸掉后须 force-reinstall headless 恢复 cv2（否则构建失败）
 RUN pip install --upgrade pip \
     && pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r /app/requirements.txt \
     && pip install "git+https://github.com/ultralytics/CLIP.git" \
-    && (pip uninstall -y opencv-python || true)
+    && pip uninstall -y opencv-python \
+    && pip install --force-reinstall --no-deps opencv-python-headless==5.0.0.93 \
+    && python -c "import cv2; from ultralytics import YOLO; print('cv2 OK', cv2.__version__)"
 
 COPY app /app/app
 COPY web /app/web
