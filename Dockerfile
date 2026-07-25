@@ -1,5 +1,8 @@
 # YOLO Studio — 纯 CPU、内网离线交付镜像
 # 有网机器 build → docker save → 内网 load
+#
+# CLIP 权重只进最终镜像的 /root/.cache/clip/ 一份：中间 stage 整理后用 COPY --from，
+# 避免「COPY weights 含 clip + 再 cp 到 cache」双份各占一层 338MB。
 
 FROM python:3.12-slim AS base
 
@@ -30,7 +33,7 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 # 与本地实测一致：torch 2.13.0+cpu / torchvision 0.28.0+cpu / ultralytics 8.4.105
-# ultralytics 会拉完整 opencv-python；卸掉后须 force-reinstall headless 恢复 cv2（否则构建失败）
+# ultralytics 会拉完整 opencv-python；卸掉后须 force-reinstall headless 恢复 cv2
 RUN pip install --upgrade pip \
     && pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r /app/requirements.txt \
@@ -39,16 +42,32 @@ RUN pip install --upgrade pip \
     && pip install --force-reinstall --no-deps opencv-python-headless==5.0.0.93 \
     && python -c "import cv2; from ultralytics import YOLO; print('cv2 OK', cv2.__version__)"
 
+# ---------- 权重整理（不进入最终镜像层）----------
+FROM base AS weight_prep
+COPY weights /w
+RUN mkdir -p /out/weights /out/clip \
+    && find /w -maxdepth 1 -type f -name '*.pt' -exec cp -a {} /out/weights/ \; \
+    && if [ -f /w/.gitkeep ]; then cp -a /w/.gitkeep /out/weights/; fi \
+    && if [ -f /w/clip/ViT-B-32.pt ]; then \
+         cp /w/clip/ViT-B-32.pt /out/clip/ViT-B-32.pt; \
+         echo "CLIP ready"; \
+       else \
+         echo "WARN: weights/clip/ViT-B-32.pt 缺失，开放词表离线不可用"; \
+       fi \
+    && ls -la /out/weights \
+    && ls -la /out/clip || true
+
+# ---------- 最终镜像 ----------
+FROM base
+
 COPY app /app/app
 COPY web /app/web
 COPY scripts /app/scripts
 COPY .env.example /app/.env.example
 
-# 检测/SAM 权重（.dockerignore 已排除 weights/clip/，避免 CLIP 双份占层）
-COPY weights /app/weights
-
-# CLIP 文本塔只放一份到运行时查找路径（构建前准备 weights/clip/ViT-B-32.pt）
-COPY weights/clip/ViT-B-32.pt /root/.cache/clip/ViT-B-32.pt
+# 检测/SAM：仅 *.pt 根目录文件；CLIP：仅 cache 一份
+COPY --from=weight_prep /out/weights /app/weights
+COPY --from=weight_prep /out/clip/ViT-B-32.pt /root/.cache/clip/ViT-B-32.pt
 
 RUN mkdir -p /root/.config/Ultralytics /app/data \
     && python - <<'PY'
@@ -83,8 +102,12 @@ SETTINGS.update({
 print("ultralytics settings updated, torch check next")
 import torch
 print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-# 必须是 CPU 版；禁止用「无 CUDA 就放过」——CUDA wheel 在无 GPU 机器上 is_available 也是 False
 assert "+cpu" in torch.__version__, f"必须是 CPU 版 torch，实际: {torch.__version__}"
+# CLIP 单份
+clip = Path("/root/.cache/clip/ViT-B-32.pt")
+assert clip.is_file(), f"CLIP 权重缺失: {clip}"
+assert not Path("/app/weights/clip").exists(), "CLIP 不应再出现在 /app/weights/clip"
+print("clip single-copy OK", clip.stat().st_size)
 print("ok")
 PY
 

@@ -1,4 +1,4 @@
-# 构建上下文瘦身
+# 构建上下文瘦身（不要 ignore weights/clip —— 中间 stage 需要读它，最终镜像再拆成单份）
 .git
 .venv
 __pycache__
@@ -8,6 +8,3 @@ data/
 docs/
 *.md
 .env
-
-# CLIP 权重单独 COPY 到 /root/.cache/clip，避免与 weights/ 双份各占一层 338MB
-weights/clip/
