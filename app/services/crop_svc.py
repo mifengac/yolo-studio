@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 from PIL import Image
 
 from app import config, db
@@ -35,6 +36,10 @@ DEFAULTS = {
     "bottom_ratio": 0.55,
     "max_crops": 8000,
     "preview_limit": 20,
+    # 质量过滤（保守阈值：宁可多放进来几张暗图，也不误删有效骑手）
+    "min_brightness": 25,  # 平均亮度低于此值丢弃（0~255）
+    "min_aspect": 0.5,  # 宽高比下限
+    "max_aspect": 3.0,  # 宽高比上限
 }
 
 
@@ -52,7 +57,27 @@ def _params_from(raw: Optional[dict]) -> dict:
     p["bottom_ratio"] = float(p["bottom_ratio"])
     p["max_crops"] = int(p["max_crops"])
     p["preview_limit"] = int(p.get("preview_limit") or DEFAULTS["preview_limit"])
+    p["min_brightness"] = float(p["min_brightness"])
+    p["min_aspect"] = float(p["min_aspect"])
+    p["max_aspect"] = float(p["max_aspect"])
     return p
+
+
+def _crop_quality_reject(crop: Image.Image, p: dict) -> Optional[str]:
+    """切图质量过滤。返回丢弃原因键名，通过则返回 None。"""
+    w, h = crop.size
+    if h <= 0 or w <= 0:
+        return "skipped_small"
+    aspect = w / h
+    if aspect < p["min_aspect"] or aspect > p["max_aspect"]:
+        return "skipped_aspect"
+    try:
+        brightness = float(np.asarray(crop.convert("L")).mean())
+    except Exception:
+        brightness = 255.0
+    if brightness < p["min_brightness"]:
+        return "skipped_dark"
+    return None
 
 
 def _match_class_name(name: str, target: str) -> bool:
@@ -142,6 +167,8 @@ def process_one_image(
     stats = {
         "detected": 0,
         "skipped_small": 0,
+        "skipped_dark": 0,
+        "skipped_aspect": 0,
         "crops": [],  # list of (filename, bytes) or preview dict
         "no_target": False,
     }
@@ -185,6 +212,17 @@ def process_one_image(
                 stats["skipped_small"] += 1
                 continue
             crop = im.crop((cx1, cy1, cx2, cy2))
+            reason = _crop_quality_reject(crop, p)
+            if reason:
+                stats[reason] = stats.get(reason, 0) + 1
+                logger.debug(
+                    "切图过滤 %s reason=%s size=%sx%s",
+                    src_filename,
+                    reason,
+                    crop.size[0],
+                    crop.size[1],
+                )
+                continue
             idx += 1
             name = f"{stem}_p{idx:02d}.jpg"
             buf = io.BytesIO()
@@ -294,6 +332,8 @@ def run_crop_import(task: dict) -> None:
         imported_total = 0
         detected_total = 0
         skipped_small = 0
+        skipped_dark = 0
+        skipped_aspect = 0
         no_target_files: list[str] = []
         done_imgs = 0
 
@@ -331,6 +371,8 @@ def run_crop_import(task: dict) -> None:
 
             detected_total += st["detected"]
             skipped_small += st["skipped_small"]
+            skipped_dark += int(st.get("skipped_dark") or 0)
+            skipped_aspect += int(st.get("skipped_aspect") or 0)
             if st["no_target"]:
                 no_target_files.append(src_name)
 
@@ -356,13 +398,16 @@ def run_crop_import(task: dict) -> None:
         no_target_show = no_target_files[:200]
         summary = (
             f"处理大图 {done_imgs} 张，检出目标 {detected_total} 个，"
-            f"跳过过小目标 {skipped_small} 个，切图入库 {imported_total} 张，"
+            f"跳过过小 {skipped_small} 个，跳过过暗 {skipped_dark} 个，"
+            f"跳过比例异常 {skipped_aspect} 个，切图入库 {imported_total} 张，"
             f"其中 {len(no_target_files)} 张大图未检出任何目标"
         )
         result = {
             "source_images": done_imgs,
             "detected": detected_total,
             "skipped_small": skipped_small,
+            "skipped_dark": skipped_dark,
+            "skipped_aspect": skipped_aspect,
             "imported": imported_total,
             "no_target_count": len(no_target_files),
             "no_target_files": no_target_show,
