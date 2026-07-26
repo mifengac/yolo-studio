@@ -350,9 +350,139 @@ def run_train_job(task: dict) -> None:
     task_mod.set_progress(task["id"], 100, "训练完成")
 
 
+def _require_data_yaml(job: dict, p: dict, run_dir: Path) -> Path:
+    """定位并校验 data.yaml；找不到就拒绝（续训绝不能静默退回 coco8）。"""
+    recorded = (p or {}).get("data_yaml")
+    yaml_path = _resolve_data_yaml(job, run_dir, recorded)
+    if not yaml_path or not yaml_path.is_file():
+        hint = f"记录路径={recorded}；" if recorded else ""
+        raise FileNotFoundError(
+            f"找不到本次训练的 data.yaml（{hint}"
+            f"也未在 datasets/{job.get('dataset_id')}/exports/{job.get('id')}/ 找到），"
+            "无法安全续训。请重新发起一次完整训练。"
+        )
+    return yaml_path.resolve()
+
+
+def _cache_arg(cache: Any) -> str:
+    if cache is False or cache == "off" or cache is None:
+        return "False"
+    return str(cache)
+
+
+def _build_train_cmd(
+    *,
+    model_path: str | Path,
+    data_yaml: Path,
+    job_id: str,
+    p: dict,
+    resume: bool,
+) -> list[str]:
+    """构造 yolo 训练命令。
+
+    续训也必须显式传 data= 等全部关键参数。
+    绝不能只靠 resume=True —— ultralytics 恢复失败会静默退回 coco8.yaml。
+    """
+    epochs = int(p.get("epochs", 40))
+    imgsz = int(p.get("imgsz", 416))
+    batch = int(p.get("batch", 16))
+    freeze = int(p.get("freeze", 10))
+    workers = int(p.get("workers", 8))
+    patience = int(p.get("patience", 10))
+    cache_arg = _cache_arg(p.get("cache", False))
+
+    cmd = _resolve_yolo_cmd() + [
+        "detect",
+        "train",
+        f"model={model_path}",
+        f"data={data_yaml}",  # ★ 首次/续训都必须显式传
+        f"epochs={epochs}",
+        f"imgsz={imgsz}",
+        f"batch={batch}",
+        f"project={config.RUNS_DIR.resolve().as_posix()}",
+        f"name={job_id}",
+        "exist_ok=True",
+        f"workers={workers}",
+        f"cache={cache_arg}",
+        "device=cpu",
+        "amp=False",
+        f"patience={patience}",
+        "verbose=True",
+    ]
+    # 首次训练：freeze>0 才传；续训：原样重传，避免参数丢失
+    if freeze and freeze > 0:
+        cmd.append(f"freeze={freeze}")
+    if resume:
+        cmd.append("resume=True")
+    return cmd
+
+
+def _verify_train_args(
+    run_dir: Path, expect_data: str | Path, expect_imgsz: int
+) -> Optional[str]:
+    """核对 args.yaml 里实际用的 data/imgsz。返回 None 表示正常，否则返回错误描述。
+
+    args.yaml 尚未生成时返回 None（下次轮询再查），不要当成失败。
+    """
+    f = run_dir / "args.yaml"
+    if not f.is_file():
+        return None
+    try:
+        import yaml
+
+        args = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+    actual = str(args.get("data") or "").strip()
+    if not actual:
+        return "训练 args.yaml 里没有 data 字段，参数异常"
+    try:
+        actual_res = Path(actual).expanduser().resolve()
+        expect_res = Path(expect_data).expanduser().resolve()
+    except Exception:
+        actual_res = Path(actual)
+        expect_res = Path(expect_data)
+    if actual_res != expect_res:
+        return (
+            f"训练实际使用的数据集是 {actual}，与预期的 {expect_data} 不符"
+            f"（ultralytics 可能静默退回了默认数据集）"
+        )
+    if args.get("imgsz") is not None and int(args["imgsz"]) != int(expect_imgsz):
+        return f"训练实际 imgsz={args['imgsz']}，与预期 {expect_imgsz} 不符"
+    return None
+
+
+def _backup_weights_before_resume(run_dir: Path, log_path: Path) -> Optional[str]:
+    """续训前备份 best.pt / last.pt。失败不阻断，返回备份目录路径。"""
+    import shutil
+
+    weights = run_dir / "weights"
+    if not weights.is_dir():
+        return None
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = weights / f"backup_before_resume_{stamp}"
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for name in ("best.pt", "last.pt"):
+            src = weights / name
+            if src.is_file():
+                shutil.copy2(src, backup_dir / name)
+                copied += 1
+        if copied == 0:
+            append_log(log_path, "续训前备份：weights 下没有 best.pt/last.pt，跳过")
+            return None
+        append_log(log_path, f"续训前已备份权重到 {backup_dir}（{copied} 个文件）")
+        return str(backup_dir.resolve())
+    except Exception as exc:
+        append_log(log_path, f"续训前备份权重失败（不阻断续训）：{exc}")
+        logger.warning("backup weights failed: %s", exc)
+        return None
+
+
 def _execute_training(job: dict, *, resume: bool) -> None:
     job_id = job["id"]
-    p = job.get("params") or {}
+    p = dict(job.get("params") or {})
     run_dir = Path(job["run_dir"])
     log_path = Path(job["log_path"])
     dataset_id = job["dataset_id"]
@@ -372,52 +502,35 @@ def _execute_training(job: dict, *, resume: bool) -> None:
             f"导出完成 train={exp['train_count']} val={exp['val_count']} yaml={exp['data_yaml']}",
         )
         append_log(log_path, f"cache 策略: {p.get('cache')}（按内存自动判定）")
-        data_yaml = exp["data_yaml"]
-        # 写入 params，续训后做 best.pt val 时还能找到 data.yaml
-        p = {**p, "data_yaml": data_yaml}
+        data_yaml = Path(exp["data_yaml"]).resolve()
+        # 写入 params，续训时必须能找回 data.yaml
+        p = {**p, "data_yaml": str(data_yaml)}
         update_job(job_id, params=p)
         model_path = p.get("base_model_path") or job["base_model"]
     else:
-        data_yaml = p.get("data_yaml")
+        # 续训：显式解析 data.yaml，找不到直接失败，绝不能带着残缺参数硬跑
+        data_yaml = _require_data_yaml(job, p, run_dir)
+        if str(p.get("data_yaml") or "") != str(data_yaml):
+            p = {**p, "data_yaml": str(data_yaml)}
+            update_job(job_id, params=p)
         model_path = job.get("resume_from") or str(run_dir / "weights" / "last.pt")
         if not Path(model_path).is_file():
             raise FileNotFoundError(f"找不到续训权重: {model_path}")
+        backup = _backup_weights_before_resume(run_dir, log_path)
+        if backup:
+            p = {**p, "last_weight_backup": backup}
+            update_job(job_id, params=p)
 
     epochs = int(p.get("epochs", 40))
     imgsz = int(p.get("imgsz", 416))
-    batch = int(p.get("batch", 16))
-    freeze = int(p.get("freeze", 10))
-    workers = int(p.get("workers", 8))
-    patience = int(p.get("patience", 10))
-    cache = p.get("cache", False)
-    if cache is False or cache == "off":
-        cache_arg = "False"
-    else:
-        cache_arg = str(cache)
 
-    cmd = _resolve_yolo_cmd() + [
-        "detect",
-        "train",
-        f"model={model_path}",
-        f"epochs={epochs}",
-        f"imgsz={imgsz}",
-        f"batch={batch}",
-        f"project={config.RUNS_DIR.resolve().as_posix()}",
-        f"name={job_id}",
-        "exist_ok=True",
-        f"workers={workers}",
-        f"cache={cache_arg}",
-        "device=cpu",
-        "amp=False",
-        f"patience={patience}",
-        "verbose=True",
-    ]
-    if freeze and freeze > 0 and not resume:
-        cmd.append(f"freeze={freeze}")
-    if resume:
-        cmd.append("resume=True")
-    else:
-        cmd.append(f"data={data_yaml}")
+    cmd = _build_train_cmd(
+        model_path=model_path,
+        data_yaml=data_yaml if isinstance(data_yaml, Path) else Path(data_yaml),
+        job_id=job_id,
+        p=p,
+        resume=resume,
+    )
 
     append_log(log_path, "命令: " + " ".join(cmd))
     env = os.environ.copy()
@@ -439,8 +552,31 @@ def _execute_training(job: dict, *, resume: bool) -> None:
     # 轮询进度：优先 results.csv 行数（日志里 tqdm 进度常不落盘）
     last_epoch = 0
     t0 = time.time()
+    args_checked = False
+    expect_data = str(Path(data_yaml).resolve())
     while True:
         ret = proc.poll()
+        # 熔断：args.yaml 一旦写出就核对 data/imgsz，不符立刻杀进程
+        if not args_checked:
+            err = _verify_train_args(run_dir, expect_data, imgsz)
+            if err:
+                append_log(log_path, f"训练参数校验失败，已终止：{err}")
+                if proc.pid:
+                    _kill_pid(int(proc.pid))
+                update_job(
+                    job_id,
+                    status="failed",
+                    finished_at=db.utcnow(),
+                    pid=None,
+                    last_epoch=_count_epochs(run_dir / "results.csv"),
+                )
+                raise RuntimeError(err)
+            if (run_dir / "args.yaml").is_file():
+                args_checked = True
+                append_log(
+                    log_path,
+                    f"训练参数校验通过：data={expect_data} imgsz={imgsz}",
+                )
         try:
             csv_n = _count_epochs(run_dir / "results.csv")
             if csv_n > last_epoch:
@@ -863,6 +999,18 @@ def resume_job(job_id: str) -> dict:
     last = job.get("resume_from") or str(Path(job["run_dir"]) / "weights" / "last.pt")
     if not Path(last).is_file():
         raise FileNotFoundError("找不到 last.pt，无法续训")
+
+    # 启动前校验 data.yaml：不存在就直接报错，绝不带着残缺参数硬跑
+    p = job.get("params") or {}
+    run_dir = Path(job["run_dir"])
+    try:
+        data_yaml = _require_data_yaml(job, p, run_dir)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+    # 补写绝对路径，便于后续 val / 再次续训
+    if str(p.get("data_yaml") or "") != str(data_yaml):
+        p = {**p, "data_yaml": str(data_yaml)}
+        update_job(job_id, params=p)
 
     with db._lock, db.connect() as conn:
         running = conn.execute(
