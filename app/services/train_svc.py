@@ -373,9 +373,12 @@ def _execute_training(job: dict, *, resume: bool) -> None:
         )
         append_log(log_path, f"cache 策略: {p.get('cache')}（按内存自动判定）")
         data_yaml = exp["data_yaml"]
+        # 写入 params，续训后做 best.pt val 时还能找到 data.yaml
+        p = {**p, "data_yaml": data_yaml}
+        update_job(job_id, params=p)
         model_path = p.get("base_model_path") or job["base_model"]
     else:
-        data_yaml = None
+        data_yaml = p.get("data_yaml")
         model_path = job.get("resume_from") or str(run_dir / "weights" / "last.pt")
         if not Path(model_path).is_file():
             raise FileNotFoundError(f"找不到续训权重: {model_path}")
@@ -433,13 +436,16 @@ def _execute_training(job: dict, *, resume: bool) -> None:
         )
     update_job(job_id, pid=proc.pid)
 
-    # 轮询进度
+    # 轮询进度：优先 results.csv 行数（日志里 tqdm 进度常不落盘）
     last_epoch = 0
     t0 = time.time()
     while True:
         ret = proc.poll()
-        # 解析 epoch：只认「当前轮/总轮数」，排除 batch 进度条（如 1/1、3/10）
         try:
+            csv_n = _count_epochs(run_dir / "results.csv")
+            if csv_n > last_epoch:
+                last_epoch = csv_n
+            # 日志兜底：只认「当前轮/总轮数」且 total==epochs
             text = log_path.read_text(encoding="utf-8", errors="ignore")[-8000:]
             for m in _EPOCH_RE.finditer(text):
                 cur, total = int(m.group(1)), int(m.group(2))
@@ -461,35 +467,145 @@ def _execute_training(job: dict, *, resume: bool) -> None:
             break
         time.sleep(5)
 
-    if proc.returncode != 0:
-        update_job(
-            job_id,
-            status="failed",
-            finished_at=db.utcnow(),
-            pid=None,
-        )
-        append_log(log_path, f"训练失败 exit={proc.returncode}")
-        raise RuntimeError(f"训练进程退出码 {proc.returncode}，请查看日志")
-
-    # 收集产物
+    # 以 results.csv 实际行数为准；退出码 0 不代表跑满（睡眠/SIGTERM/早停都会干扰）
+    actual = _count_epochs(run_dir / "results.csv")
     best = run_dir / "weights" / "best.pt"
     last = run_dir / "weights" / "last.pt"
-    metrics = _read_metrics(run_dir / "results.csv")
+    resume_path = str(last) if last.is_file() else None
+
+    # 用户已点取消：保留 canceled，只回填真实轮次
+    try:
+        cur = get_job(job_id)
+        if cur.get("status") == "canceled":
+            update_job(
+                job_id,
+                last_epoch=actual,
+                pid=None,
+                resume_from=resume_path,
+            )
+            append_log(
+                log_path,
+                f"训练已取消：目标 {epochs} 轮，实际完成 {actual} 轮（退出码 {proc.returncode}）",
+            )
+            return
+    except Exception:
+        pass
+
+    # 正常收尾（含 patience 早停）会写 results.png；中途被杀则通常没有
+    clean = _training_finished_cleanly(run_dir)
+    incomplete = (proc.returncode != 0) or (actual < epochs and not clean)
+
+    if incomplete:
+        # last.pt 在且已有进度 → interrupted（可续训）；否则 failed
+        can_resume = last.is_file() and actual > 0
+        status = "interrupted" if can_resume else "failed"
+        metrics = _read_metrics(run_dir / "results.csv")
+        if metrics:
+            metrics.setdefault("metrics_from", "partial results.csv")
+        update_job(
+            job_id,
+            status=status,
+            last_epoch=actual,
+            finished_at=db.utcnow(),
+            pid=None,
+            resume_from=resume_path,
+            best_pt=str(best) if best.is_file() else resume_path,
+            metrics=metrics or None,
+            eta_seconds=0,
+        )
+        append_log(
+            log_path,
+            f"训练未完成：目标 {epochs} 轮，实际完成 {actual} 轮"
+            f"（退出码 {proc.returncode}，收尾标记={'有' if clean else '无'}）。"
+            + ("可点「继续训练」从断点接着跑。" if can_resume else "找不到可用的 last.pt，无法续训。"),
+        )
+        if status == "failed":
+            raise RuntimeError(
+                f"训练失败：目标 {epochs} 轮，实际 {actual} 轮，退出码 {proc.returncode}，请查看日志"
+            )
+        return
+
+    # 真正完成（跑满 或 早停正常收尾）
+    metrics = _collect_success_metrics(
+        job=job,
+        run_dir=run_dir,
+        best_pt=best,
+        data_yaml=data_yaml,
+        imgsz=imgsz,
+        log_path=log_path,
+    )
     update_job(
         job_id,
         status="success",
-        best_pt=str(best) if best.is_file() else (str(last) if last.is_file() else None),
+        best_pt=str(best) if best.is_file() else resume_path,
         metrics=metrics,
-        last_epoch=epochs,
+        last_epoch=actual,  # 真实完成轮数，不要写死成目标 epochs
         eta_seconds=0,
         finished_at=db.utcnow(),
         pid=None,
-        resume_from=str(last) if last.is_file() else None,
+        resume_from=resume_path,
     )
-    append_log(log_path, f"训练成功 metrics={metrics}")
+    append_log(
+        log_path,
+        f"训练成功：目标 {epochs} 轮，实际完成 {actual} 轮 metrics={metrics}",
+    )
+
+
+def _count_epochs(csv_path: Path) -> int:
+    """results.csv 每轮一行（不含表头），行数即已完成轮数。"""
+    if not csv_path.is_file():
+        return 0
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
+    except Exception:
+        return 0
+
+
+def _training_finished_cleanly(run_dir: Path) -> bool:
+    """训练循环正常结束（含早停）时 ultralytics 会写 results.png。"""
+    return (run_dir / "results.png").is_file()
+
+
+def _row_to_metrics(row: dict) -> dict:
+    def g(*keys):
+        for k in keys:
+            if k in row and row[k] not in ("", None):
+                try:
+                    return float(row[k])
+                except ValueError:
+                    return row[k]
+        return None
+
+    return {
+        "epoch": g("epoch"),
+        "precision": g("metrics/precision(B)", "metrics/precision"),
+        "recall": g("metrics/recall(B)", "metrics/recall"),
+        "mAP50": g("metrics/mAP50(B)", "metrics/mAP50"),
+        "mAP50-95": g("metrics/mAP50-95(B)", "metrics/mAP50-95"),
+        "box_loss": g("train/box_loss"),
+        "cls_loss": g("train/cls_loss"),
+    }
+
+
+def _fitness_of_row(row: dict) -> float:
+    """ultralytics 默认 fitness ≈ 0.1*mAP50 + 0.9*mAP50-95。"""
+    def f(*keys):
+        for k in keys:
+            if k in row and row[k] not in ("", None):
+                try:
+                    return float(row[k])
+                except ValueError:
+                    pass
+        return 0.0
+
+    m50 = f("metrics/mAP50(B)", "metrics/mAP50")
+    m95 = f("metrics/mAP50-95(B)", "metrics/mAP50-95")
+    return 0.1 * m50 + 0.9 * m95
 
 
 def _read_metrics(csv_path: Path) -> dict:
+    """从 results.csv 取 fitness 最高的那一行（不再用最后一行）。"""
     if not csv_path.is_file():
         return {}
     try:
@@ -497,28 +613,199 @@ def _read_metrics(csv_path: Path) -> dict:
             rows = list(csv.DictReader(f))
         if not rows:
             return {}
-        last = rows[-1]
-
-        def g(*keys):
-            for k in keys:
-                if k in last and last[k] not in ("", None):
-                    try:
-                        return float(last[k])
-                    except ValueError:
-                        return last[k]
-            return None
-
-        return {
-            "epoch": g("epoch"),
-            "precision": g("metrics/precision(B)", "metrics/precision"),
-            "recall": g("metrics/recall(B)", "metrics/recall"),
-            "mAP50": g("metrics/mAP50(B)", "metrics/mAP50"),
-            "mAP50-95": g("metrics/mAP50-95(B)", "metrics/mAP50-95"),
-            "box_loss": g("train/box_loss"),
-            "cls_loss": g("train/cls_loss"),
-        }
+        best_row = max(rows, key=_fitness_of_row)
+        return _row_to_metrics(best_row)
     except Exception:
         return {}
+
+
+def _resolve_data_yaml(
+    job: dict, run_dir: Path, data_yaml: Optional[str]
+) -> Optional[Path]:
+    """定位训练用的 data.yaml（续训时本地变量可能为空）。"""
+    if data_yaml:
+        p = Path(data_yaml)
+        if p.is_file():
+            return p
+    params = job.get("params") or {}
+    for key in ("data_yaml", "data"):
+        v = params.get(key)
+        if v and Path(v).is_file():
+            return Path(v)
+    # 导出约定：datasets/<id>/exports/<job_id>/data.yaml
+    ds_id = job.get("dataset_id")
+    if ds_id:
+        cand = config.DATASETS_DIR / ds_id / "exports" / job["id"] / "data.yaml"
+        if cand.is_file():
+            return cand
+    # args.yaml 里的 data 字段
+    args_path = run_dir / "args.yaml"
+    if args_path.is_file():
+        try:
+            for line in args_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("data:"):
+                    val = line.split(":", 1)[1].strip().strip("'\"")
+                    if val and Path(val).is_file():
+                        return Path(val)
+        except Exception:
+            pass
+    return None
+
+
+def _parse_val_log_metrics(text: str) -> dict:
+    """从 yolo detect val 日志解析 all 行的 P/R/mAP（备用）。"""
+    # 典型：all  100  200  0.95  0.90  0.96  0.75
+    pat = re.compile(
+        r"^\s*all\s+\d+\s+\d+\s+"
+        r"([0-9]*\.?[0-9]+)\s+"
+        r"([0-9]*\.?[0-9]+)\s+"
+        r"([0-9]*\.?[0-9]+)\s+"
+        r"([0-9]*\.?[0-9]+)",
+        re.MULTILINE,
+    )
+    matches = list(pat.finditer(text))
+    if not matches:
+        return {}
+    m = matches[-1]
+    return {
+        "precision": float(m.group(1)),
+        "recall": float(m.group(2)),
+        "mAP50": float(m.group(3)),
+        "mAP50-95": float(m.group(4)),
+    }
+
+
+def _validate_best_pt(
+    *,
+    best_pt: Path,
+    data_yaml: Path,
+    imgsz: int,
+    run_dir: Path,
+    log_path: Path,
+) -> dict:
+    """用 best.pt 跑一次 val，返回指标。
+
+    优先走 ultralytics Python API（CLI 的 LOGGER 不进重定向文件，日志常为空）。
+    失败再尝试 CLI + 日志解析。
+    """
+    append_log(
+        log_path,
+        f"开始用 best.pt 做验证: model={best_pt} data={data_yaml} imgsz={imgsz}",
+    )
+    # 1) Python API
+    try:
+        from ultralytics import YOLO
+
+        model = YOLO(str(best_pt))
+        res = model.val(
+            data=str(data_yaml),
+            imgsz=imgsz,
+            device="cpu",
+            verbose=False,
+            project=str(run_dir.resolve()),
+            name="val_best",
+            exist_ok=True,
+            plots=False,
+        )
+        box = getattr(res, "box", None)
+        if box is None:
+            raise RuntimeError("val 结果没有 box 指标")
+        parsed = {
+            "precision": float(box.mp),
+            "recall": float(box.mr),
+            "mAP50": float(box.map50),
+            "mAP50-95": float(box.map),
+        }
+        return parsed
+    except Exception as exc:
+        append_log(log_path, f"best.pt Python val 失败，尝试 CLI: {exc}")
+
+    # 2) CLI 兜底
+    val_dir = run_dir / "val_best"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    val_log = val_dir / "val.log"
+    cmd = [
+        _resolve_yolo_bin(),
+        "detect",
+        "val",
+        f"model={best_pt}",
+        f"data={data_yaml}",
+        f"imgsz={imgsz}",
+        "device=cpu",
+        "verbose=True",
+        f"project={run_dir.resolve().as_posix()}",
+        "name=val_best",
+        "exist_ok=True",
+    ]
+    env = os.environ.copy()
+    env["YOLO_OFFLINE"] = "1"
+    env["OMP_NUM_THREADS"] = str(config.CPU_THREADS)
+    env["MKL_NUM_THREADS"] = str(config.CPU_THREADS)
+    with open(val_log, "w", encoding="utf-8") as lf:
+        proc = subprocess.run(
+            cmd,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            cwd=str(config.BASE_DIR),
+            env=env,
+            timeout=3600,
+        )
+    text = val_log.read_text(encoding="utf-8", errors="ignore") if val_log.is_file() else ""
+    if proc.returncode != 0:
+        raise RuntimeError(f"best.pt val 退出码 {proc.returncode}")
+    parsed = _parse_val_log_metrics(text)
+    if not parsed:
+        raise RuntimeError("best.pt val 日志里解析不到指标")
+    return parsed
+
+
+def _collect_success_metrics(
+    *,
+    job: dict,
+    run_dir: Path,
+    best_pt: Path,
+    data_yaml: Optional[str],
+    imgsz: int,
+    log_path: Path,
+) -> dict:
+    """训练成功后优先用 best.pt val 指标；失败则回退到 results.csv 最优行。"""
+    yaml_path = _resolve_data_yaml(job, run_dir, data_yaml)
+    if best_pt.is_file() and yaml_path is not None:
+        try:
+            val_m = _validate_best_pt(
+                best_pt=best_pt,
+                data_yaml=yaml_path,
+                imgsz=imgsz,
+                run_dir=run_dir,
+                log_path=log_path,
+            )
+            # 附上 results.csv 最优轮次作对照
+            csv_m = _read_metrics(run_dir / "results.csv")
+            out = {
+                "epoch": csv_m.get("epoch"),
+                "precision": val_m.get("precision"),
+                "recall": val_m.get("recall"),
+                "mAP50": val_m.get("mAP50"),
+                "mAP50-95": val_m.get("mAP50-95"),
+                "box_loss": csv_m.get("box_loss"),
+                "cls_loss": csv_m.get("cls_loss"),
+                "metrics_from": "best.pt val",
+            }
+            append_log(log_path, f"best.pt val 指标: {out}")
+            return out
+        except Exception as exc:
+            append_log(log_path, f"best.pt val 失败，回退 results.csv 最优行: {exc}")
+            m = _read_metrics(run_dir / "results.csv")
+            # 任务书要求标明来源；实际取 fitness 最高行作兜底
+            m["metrics_from"] = "best fitness epoch (val failed)"
+            return m
+
+    m = _read_metrics(run_dir / "results.csv")
+    if not best_pt.is_file():
+        m["metrics_from"] = "best fitness epoch (no best.pt)"
+    else:
+        m["metrics_from"] = "best fitness epoch (no data.yaml)"
+    return m
 
 
 def read_metrics_series(job_id: str) -> list[dict]:
@@ -686,16 +973,19 @@ def recover_interrupted_jobs() -> int:
                 r["id"],
             )
         resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
+        run_dir = Path(r["run_dir"])
+        actual = _count_epochs(run_dir / "results.csv")
         update_job(
             r["id"],
             status="interrupted",
+            last_epoch=actual if actual > 0 else r["last_epoch"],
             finished_at=db.utcnow(),
             pid=None,
             resume_from=resume if Path(resume).is_file() else r["resume_from"],
         )
         append_log(
-            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
-            "服务重启，任务中断（请点「继续训练」从断点恢复）",
+            r["log_path"] or (run_dir / "train.log"),
+            f"服务重启，任务中断（已完成约 {actual} 轮，请点「继续训练」从断点恢复）",
         )
         n += 1
     return n
@@ -723,16 +1013,19 @@ def kill_running_train_processes() -> int:
                 r["id"],
             )
         resume = r["resume_from"] or str(Path(r["run_dir"]) / "weights" / "last.pt")
+        run_dir = Path(r["run_dir"])
+        actual = _count_epochs(run_dir / "results.csv")
         update_job(
             r["id"],
             status="interrupted",
+            last_epoch=actual if actual > 0 else r["last_epoch"],
             finished_at=db.utcnow(),
             pid=None,
             resume_from=resume if Path(resume).is_file() else r["resume_from"],
         )
         append_log(
-            r["log_path"] or (Path(r["run_dir"]) / "train.log"),
-            "服务关闭，训练进程已终止",
+            r["log_path"] or (run_dir / "train.log"),
+            f"服务关闭，训练进程已终止（已完成约 {actual} 轮）",
         )
         n += 1
     return n
