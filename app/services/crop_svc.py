@@ -334,6 +334,8 @@ def run_crop_import(task: dict) -> None:
         skipped_small = 0
         skipped_dark = 0
         skipped_aspect = 0
+        skipped_dup_total = 0
+        skipped_bad_total = 0
         no_target_files: list[str] = []
         done_imgs = 0
 
@@ -386,6 +388,8 @@ def run_crop_import(task: dict) -> None:
                     group_key=src_name,
                 )
                 imported_total += int(r.get("imported") or 0)
+                skipped_dup_total += int(r.get("skipped_dup") or 0)
+                skipped_bad_total += int(r.get("skipped_bad") or 0)
 
             done_imgs += 1
             task_mod.set_progress(
@@ -396,18 +400,44 @@ def run_crop_import(task: dict) -> None:
 
         # 未检出列表截断，避免 params 过大
         no_target_show = no_target_files[:200]
+        # 闭合：检出 = 过小 + 过暗 + 比例异常 + 重复 + 损坏 + 入库
         summary = (
             f"处理大图 {done_imgs} 张，检出目标 {detected_total} 个，"
             f"跳过过小 {skipped_small} 个，跳过过暗 {skipped_dark} 个，"
-            f"跳过比例异常 {skipped_aspect} 个，切图入库 {imported_total} 张，"
+            f"跳过比例异常 {skipped_aspect} 个，跳过重复 {skipped_dup_total} 个"
+            + (f"，跳过损坏 {skipped_bad_total} 个" if skipped_bad_total else "")
+            + f"，切图入库 {imported_total} 张，"
             f"其中 {len(no_target_files)} 张大图未检出任何目标"
         )
+        accounted = (
+            skipped_small
+            + skipped_dark
+            + skipped_aspect
+            + skipped_dup_total
+            + skipped_bad_total
+            + imported_total
+        )
+        if detected_total != accounted:
+            logger.warning(
+                "切图统计未闭合：检出=%s 合计=%s（过小=%s 过暗=%s 比例=%s 重复=%s 损坏=%s 入库=%s）",
+                detected_total,
+                accounted,
+                skipped_small,
+                skipped_dark,
+                skipped_aspect,
+                skipped_dup_total,
+                skipped_bad_total,
+                imported_total,
+            )
+            summary += f"（统计核对：合计 {accounted}/{detected_total}）"
         result = {
             "source_images": done_imgs,
             "detected": detected_total,
             "skipped_small": skipped_small,
             "skipped_dark": skipped_dark,
             "skipped_aspect": skipped_aspect,
+            "skipped_dup": skipped_dup_total,
+            "skipped_bad": skipped_bad_total,
             "imported": imported_total,
             "no_target_count": len(no_target_files),
             "no_target_files": no_target_show,
