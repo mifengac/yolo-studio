@@ -217,12 +217,13 @@
             <label>尺寸 <input type="number" v-model.number="trainForm.imgsz" min="128" max="1280" step="32" @change="refreshEstimate" /></label>
             <label>batch <input type="number" v-model.number="trainForm.batch" min="1" max="64" @change="refreshEstimate" /></label>
             <label>freeze <input type="number" v-model.number="trainForm.freeze" min="0" max="50" @change="refreshEstimate" /></label>
-            <label><input type="checkbox" v-model="trainForm.only_confirmed" @change="refreshEstimate" /> 仅已确认样本</label>
+            <label><input type="checkbox" v-model="trainForm.only_confirmed" @change="refreshEstimate" /> 仅人工确认的样本（排除未审核的预标注）</label>
             <label v-if="estimate && estimate.blocked"><input type="checkbox" v-model="trainForm.force_long" /> 我知道会很久，仍然继续</label>
           </div>
           <div class="estimate" v-if="estimate">
             <strong>预计耗时：{{ estimate.human }}</strong>
             <span class="muted">（cache={{ estimate.cache }}，约 {{ Math.round(estimate.seconds_per_epoch) }} 秒/轮）</span>
+            <div class="hint" v-if="estimate.composition_text">{{ estimate.composition_text }}</div>
             <div class="warn" v-for="t in estimate.tips" :key="t">{{ t }}</div>
           </div>
           <div class="row">

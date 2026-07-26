@@ -49,6 +49,8 @@ def estimate(body: TrainEstimateRequest):
         "class_counts": report["class_counts"],
         "warnings": report.get("warnings") or [],
         "data_ok": report.get("ok", False),
+        "composition": report.get("composition") or {},
+        "composition_text": report.get("composition_text") or "",
         **est,
         "tips": tips,
     }
