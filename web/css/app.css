@@ -48,7 +48,7 @@ input, select, textarea {
 .pill.running { background: #1d4ed8; }
 .pill.success { background: #166534; }
 .pill.failed, .pill.canceled { background: #7f1d1d; }
-.pill.interrupted { background: #92400e; }
+.pill.interrupted { background: #b45309; color: #fef3c7; font-weight: 600; }
 .ds-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 .stats { font-size: 13px; color: var(--muted); margin: 6px 0 10px; }
 .task-msg { margin-top: 8px; font-size: 12px; color: #93c5fd; }

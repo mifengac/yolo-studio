@@ -238,8 +238,8 @@
             <div>
               <strong>{{ j.id }}</strong>
               <span class="pill" :class="j.status">{{ statusCn(j.status) }}</span>
-              <span class="muted"> epoch {{ j.last_epoch || 0 }}</span>
-              <span class="muted" v-if="j.eta_seconds"> · 剩余约 {{ fmtSec(j.eta_seconds) }}</span>
+              <span class="muted"> epoch {{ j.last_epoch || 0 }} / {{ j.params?.epochs || '?' }}</span>
+              <span class="muted" v-if="j.eta_seconds && j.status==='running'"> · 剩余约 {{ fmtSec(j.eta_seconds) }}</span>
             </div>
             <div class="row">
               <button v-if="j.status==='running'" @click="cancelTrain(j)">取消</button>
@@ -253,7 +253,9 @@
           </div>
           <div v-if="j.metrics && j.metrics.mAP50 != null" class="muted">
             mAP50={{ j.metrics.mAP50 }} · mAP50-95={{ j.metrics['mAP50-95'] }} · P={{ j.metrics.precision }} · R={{ j.metrics.recall }}
+            <span v-if="j.metrics.metrics_from"> · 来源 {{ j.metrics.metrics_from }}</span>
           </div>
+          <div v-if="j.status==='interrupted'" class="hint">训练未跑完（{{ j.last_epoch || 0 }} / {{ j.params?.epochs || '?' }} 轮）。可点「继续训练」从断点接着跑。</div>
           <div class="row wrap" v-if="j.status==='success' && j.best_pt">
             <a class="button" :href="'/api/train/'+j.id+'/artifacts/best.pt'">下载 best.pt</a>
             <a class="button" :href="'/api/train/'+j.id+'/artifacts/last.pt'">下载 last.pt</a>
