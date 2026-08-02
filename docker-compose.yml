@@ -3,7 +3,7 @@ services:
     image: yolo-studio:latest
     build: .
     ports:
-      - "5016:5016"
+      - "5013:5013"
     shm_size: "2gb"
     environment:
       - CPU_THREADS=14
@@ -12,7 +12,7 @@ services:
       - YOLO_OFFLINE=1
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
-      - APP_PORT=5016
+      - APP_PORT=5013
     volumes:
       # CentOS SELinux 需 :z
       - ./data:/app/data:z

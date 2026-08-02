@@ -69,6 +69,7 @@
               <button @click="runOpenvocab(d)">开放词表</button>
               <button @click="runTrack(d)">视频跟踪传播</button>
               <button @click="runDedup(d)">近重复去重</button>
+              <button @click="runAnnotationDedup(d)">清理重复框</button>
               <button @click="clearAutoAnnotations(d)">清空预标注</button>
               <button @click="editClasses(d)">编辑类别</button>
               <button class="danger" @click="removeDataset(d)">删除</button>
@@ -86,7 +87,7 @@
               <button @click="alPanel.show=false">关闭</button>
             </div>
             <p class="hint">
-              阈值越低框越多但越不准；新训练的模型样本不足时建议 0.1~0.2。
+              置信度阈值越低框越多但越不准；新训练的模型样本不足时建议 0.1~0.2。
               类别必须和模型一致，否则会拒绝，避免写错标注。
             </p>
             <label>模型
@@ -100,6 +101,12 @@
             <label>置信度阈值 conf
               <input type="number" min="0.05" max="0.9" step="0.05" v-model.number="alPanel.conf" />
             </label>
+            <label>框重叠合并阈值 iou
+              <input type="number" min="0.1" max="0.95" step="0.05" v-model.number="alPanel.iou" />
+            </label>
+            <p class="muted" style="margin:4px 0 8px;font-size:12px">
+              框重叠合并阈值，越小越不容易出现重复框；发现同一目标被框多次时调低。默认 0.35。
+            </p>
             <label><input type="checkbox" v-model="alPanel.overwrite" /> 覆盖已有自动标注</label>
             <div class="row" style="margin-top:12px">
               <button class="primary" @click="submitAutolabel">开始预标注</button>
@@ -119,8 +126,9 @@
               <button @click="closeCropImport">关闭</button>
             </div>
             <p class="hint">
-              用检测模型（默认 yolo26n / person）从卡口大图切出上半身，切图入库供头盔等小目标标注。
+              用检测模型（默认 yolo26n / person）从卡口大图切出人+车身区域，切图入库供头盔等小目标标注。
               原图不入库；同一张原图的切图共享 group_key，训练时不会拆到 train/val 两边。
+              默认 bottom_ratio=1.30（须与线上 bczj-classifier 一致）。
             </p>
             <div class="row wrap">
               <label>来源
@@ -151,10 +159,17 @@
                 <label>最小框高 <input type="number" v-model.number="cropPanel.params.min_box_h" /></label>
                 <label>左右外扩 pad_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.pad_ratio" /></label>
                 <label>上扩 top_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.top_ratio" /></label>
-                <label>下切 bottom_ratio <input type="number" step="0.05" v-model.number="cropPanel.params.bottom_ratio" /></label>
+                <label>下边界比例 bottom_ratio
+                  <input type="number" step="0.05" v-model.number="cropPanel.params.bottom_ratio" />
+                </label>
                 <label>预览大图数 <input type="number" v-model.number="cropPanel.params.preview_limit" /></label>
                 <label>单次最多切图 <input type="number" v-model.number="cropPanel.params.max_crops" /></label>
               </div>
+              <p class="muted" style="margin-top:8px;font-size:12px">
+                下边界比例 (bottom_ratio) 默认 1.30：取到 person 框高的 130%，包含车身。
+                这是区分「骑手」与「行人」的关键——切得太短（如 0.55）看不到车，模型学不会拒绝行人。
+                改此值后，线上 bczj-classifier 必须同步，否则准确率会断崖下跌。
+              </p>
             </details>
             <div class="row wrap" style="margin-top:10px">
               <button class="primary" @click="runCropPreview" :disabled="cropPanel.busy">先预览 20 张</button>

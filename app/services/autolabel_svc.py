@@ -159,7 +159,7 @@ def run_autolabel(task: dict) -> None:
     classes = ds["classes"]
     model_path = config.resolve_weight_path(params.get("model", ""))
     conf = float(params.get("conf", 0.15))
-    iou = float(params.get("iou", 0.5))
+    iou = float(params.get("iou", 0.35))
     imgsz = int(params.get("imgsz", 640))
     scope = params.get("scope") or "unlabeled"
     overwrite = bool(params.get("overwrite", False))

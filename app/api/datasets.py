@@ -7,7 +7,13 @@ import json
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app import config
-from app.schemas import CropImportFromDataset, CropImportParams, DatasetCreate, DatasetUpdate
+from app.schemas import (
+    AnnotationDedupRequest,
+    CropImportFromDataset,
+    CropImportParams,
+    DatasetCreate,
+    DatasetUpdate,
+)
 from app.services import crop_svc, dataset_svc, track_svc
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
@@ -165,6 +171,25 @@ def clear_auto_annotations(dataset_id: str):
         return dataset_svc.clear_auto_annotations(dataset_id)
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
+
+
+@router.post("/{dataset_id}/annotations/dedup")
+def dedup_annotations(dataset_id: str, body: AnnotationDedupRequest | None = None):
+    """清理重复框：同图上高度重叠时保留置信度最高的一个。
+
+    默认只处理 source=auto，不碰人工标注。
+    """
+    body = body or AnnotationDedupRequest()
+    try:
+        return dataset_svc.dedup_annotations(
+            dataset_id,
+            iou_threshold=body.iou_threshold,
+            scope=body.scope,
+        )
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 def _parse_crop_params(params_json: str | None) -> dict:

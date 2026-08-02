@@ -664,6 +664,147 @@ def confirm_image(image_id: str) -> dict:
     )
 
 
+def _xyxy_from_yolo(cx: float, cy: float, w: float, h: float) -> tuple[float, float, float, float]:
+    """YOLO 归一化 cxcywh → 归一化 xyxy。"""
+    x1 = cx - w / 2.0
+    y1 = cy - h / 2.0
+    x2 = cx + w / 2.0
+    y2 = cy + h / 2.0
+    return x1, y1, x2, y2
+
+
+def _box_iou(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _nms_drop_ids(
+    boxes: list[dict], iou_threshold: float
+) -> list[int]:
+    """跨类别 NMS：按 conf 降序保留，重叠超阈值则丢掉。返回应删除的 annotation id。"""
+    if len(boxes) < 2:
+        return []
+    ranked = sorted(
+        boxes,
+        key=lambda b: (float(b.get("conf") or 0.0), int(b.get("id") or 0)),
+        reverse=True,
+    )
+    keep: list[dict] = []
+    drop_ids: list[int] = []
+    for b in ranked:
+        xyxy = _xyxy_from_yolo(
+            float(b["cx"]), float(b["cy"]), float(b["w"]), float(b["h"])
+        )
+        suppressed = False
+        for k in keep:
+            kxy = _xyxy_from_yolo(
+                float(k["cx"]), float(k["cy"]), float(k["w"]), float(k["h"])
+            )
+            if _box_iou(xyxy, kxy) >= iou_threshold:
+                suppressed = True
+                break
+        if suppressed:
+            drop_ids.append(int(b["id"]))
+        else:
+            keep.append(b)
+    return drop_ids
+
+
+def dedup_annotations(
+    dataset_id: str,
+    *,
+    iou_threshold: float = 0.6,
+    scope: str = "auto",
+) -> dict:
+    """清理每张图上高度重叠的重复框（跨类别）。
+
+    scope=auto：只处理 source='auto' 的框（默认，不碰人工标注）；
+    scope=all：该图所有框参与 NMS。
+    重叠时保留置信度更高的框。
+    """
+    get_dataset(dataset_id)
+    thr = float(iou_threshold)
+    if thr <= 0 or thr > 1:
+        raise ValueError("iou_threshold 必须在 (0, 1] 内")
+    scope = (scope or "auto").strip().lower()
+    if scope not in ("auto", "all"):
+        raise ValueError("scope 只能是 auto 或 all")
+
+    deleted = 0
+    affected_images = 0
+    with db._lock, db.connect() as conn:
+        images = conn.execute(
+            "SELECT id FROM image WHERE dataset_id=?", (dataset_id,)
+        ).fetchall()
+        for img in images:
+            iid = img["id"]
+            if scope == "auto":
+                rows = conn.execute(
+                    """SELECT id, class_idx, cx, cy, w, h, conf, source
+                       FROM annotation WHERE image_id=? AND source='auto'
+                       ORDER BY id""",
+                    (iid,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT id, class_idx, cx, cy, w, h, conf, source
+                       FROM annotation WHERE image_id=?
+                       ORDER BY id""",
+                    (iid,),
+                ).fetchall()
+            boxes = [dict(r) for r in rows]
+            drop_ids = _nms_drop_ids(boxes, thr)
+            if not drop_ids:
+                continue
+            for aid in drop_ids:
+                conn.execute("DELETE FROM annotation WHERE id=?", (aid,))
+            rem = conn.execute(
+                "SELECT COUNT(*) AS c FROM annotation WHERE image_id=?",
+                (iid,),
+            ).fetchone()["c"]
+            if rem == 0:
+                conn.execute(
+                    """UPDATE image SET box_count=0, review_status='unlabeled',
+                       uncertainty=0 WHERE id=?""",
+                    (iid,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE image SET box_count=? WHERE id=?",
+                    (rem, iid),
+                )
+            deleted += len(drop_ids)
+            affected_images += 1
+        conn.execute(
+            "UPDATE dataset SET updated_at=? WHERE id=?",
+            (db.utcnow(), dataset_id),
+        )
+    return {
+        "dataset_id": dataset_id,
+        "deleted": deleted,
+        "affected_images": affected_images,
+        "iou_threshold": thr,
+        "scope": scope,
+    }
+
+
 def clear_auto_annotations(dataset_id: str) -> dict:
     """只删 source='auto' 的预标注框，手工标注不动。
 

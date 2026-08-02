@@ -25,6 +25,8 @@ from app.services import dataset_svc
 logger = logging.getLogger(__name__)
 
 # 默认参数（实测标定，勿随意改）
+# ★ bottom_ratio 必须与 bczj-classifier 的 CROP_PARAMS 保持一致。
+# 训练用 1.3 而推理用 0.55（或反之），模型准确率会大幅下降且难以排查。
 DEFAULTS = {
     "model": "yolo26n.pt",
     "target_class": "person",
@@ -33,7 +35,8 @@ DEFAULTS = {
     "min_box_h": 100,
     "pad_ratio": 0.25,
     "top_ratio": -0.15,
-    "bottom_ratio": 0.55,
+    # 1.30：必须包含车身，否则模型学不会区分骑手与行人（0.55 只到腰部）
+    "bottom_ratio": 1.30,
     "max_crops": 8000,
     "preview_limit": 20,
     # 质量过滤（保守阈值：宁可多放进来几张暗图，也不误删有效骑手）
@@ -96,7 +99,10 @@ def crop_box_region(
     top_ratio: float,
     bottom_ratio: float,
 ) -> tuple[int, int, int, int]:
-    """按标定规则从 person 框算上半身切图区域（像素，含边界 clamp）。"""
+    """按标定规则从 person 框算切图区域（像素，含边界 clamp）。
+
+    bottom_ratio=1.3 时尽量包住人+车身，便于模型用车身上下文区分骑手与行人。
+    """
     bw = max(0.0, x2 - x1)
     bh = max(0.0, y2 - y1)
     pad = bw * pad_ratio
@@ -169,7 +175,8 @@ def process_one_image(
         "skipped_small": 0,
         "skipped_dark": 0,
         "skipped_aspect": 0,
-        "crops": [],  # list of (filename, bytes) or preview dict
+        "crops": [],  # list of (filename, bytes)
+        "crop_sizes": [],  # list of (w, h)，用于汇总中位尺寸
         "no_target": False,
     }
     if max_remaining <= 0:
@@ -228,6 +235,7 @@ def process_one_image(
             buf = io.BytesIO()
             crop.save(buf, format="JPEG", quality=92)
             stats["crops"].append((name, buf.getvalue()))
+            stats["crop_sizes"].append((int(crop.size[0]), int(crop.size[1])))
             if len(stats["crops"]) >= max_remaining:
                 break
     return stats
@@ -338,6 +346,8 @@ def run_crop_import(task: dict) -> None:
         skipped_bad_total = 0
         no_target_files: list[str] = []
         done_imgs = 0
+        all_crop_ws: list[int] = []
+        all_crop_hs: list[int] = []
 
         for src_name, src_path in image_list:
             if _task_canceled(task_id):
@@ -390,6 +400,9 @@ def run_crop_import(task: dict) -> None:
                 imported_total += int(r.get("imported") or 0)
                 skipped_dup_total += int(r.get("skipped_dup") or 0)
                 skipped_bad_total += int(r.get("skipped_bad") or 0)
+                for cw, ch in st.get("crop_sizes") or []:
+                    all_crop_ws.append(int(cw))
+                    all_crop_hs.append(int(ch))
 
             done_imgs += 1
             task_mod.set_progress(
@@ -400,13 +413,25 @@ def run_crop_import(task: dict) -> None:
 
         # 未检出列表截断，避免 params 过大
         no_target_show = no_target_files[:200]
+        median_size_str = ""
+        median_w = median_h = None
+        if all_crop_ws and all_crop_hs:
+            sw = sorted(all_crop_ws)
+            sh = sorted(all_crop_hs)
+            mid = len(sw) // 2
+            if len(sw) % 2:
+                median_w, median_h = sw[mid], sh[mid]
+            else:
+                median_w = (sw[mid - 1] + sw[mid]) // 2
+                median_h = (sh[mid - 1] + sh[mid]) // 2
+            median_size_str = f"，中位尺寸 {median_w}×{median_h}"
         # 闭合：检出 = 过小 + 过暗 + 比例异常 + 重复 + 损坏 + 入库
         summary = (
             f"处理大图 {done_imgs} 张，检出目标 {detected_total} 个，"
             f"跳过过小 {skipped_small} 个，跳过过暗 {skipped_dark} 个，"
             f"跳过比例异常 {skipped_aspect} 个，跳过重复 {skipped_dup_total} 个"
             + (f"，跳过损坏 {skipped_bad_total} 个" if skipped_bad_total else "")
-            + f"，切图入库 {imported_total} 张，"
+            + f"，切图入库 {imported_total} 张{median_size_str}，"
             f"其中 {len(no_target_files)} 张大图未检出任何目标"
         )
         accounted = (
@@ -441,6 +466,8 @@ def run_crop_import(task: dict) -> None:
             "imported": imported_total,
             "no_target_count": len(no_target_files),
             "no_target_files": no_target_show,
+            "median_w": median_w,
+            "median_h": median_h,
         }
         # 直接标 success，避免 tasks 框架用默认「完成」盖掉总结文案
         task_mod.update_task(

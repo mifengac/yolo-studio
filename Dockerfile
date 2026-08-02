@@ -111,5 +111,6 @@ print("clip single-copy OK", clip.stat().st_size)
 print("ok")
 PY
 
-EXPOSE 5016
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5016"]
+EXPOSE 5013
+# 端口由 APP_PORT 环境变量控制（默认 5013），改端口不必重新构建镜像
+CMD ["sh", "-c", "python -m uvicorn app.main:app --host 0.0.0.0 --port ${APP_PORT:-5013}"]

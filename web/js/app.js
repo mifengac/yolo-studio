@@ -89,7 +89,8 @@ document.addEventListener("DOMContentLoaded", () => {
             min_box_h: 100,
             pad_ratio: 0.25,
             top_ratio: -0.15,
-            bottom_ratio: 0.55,
+            // 1.30：包含车身，才能区分骑手与行人（须与 bczj-classifier 一致）
+            bottom_ratio: 1.30,
             max_crops: 8000,
             preview_limit: 20,
           },
@@ -99,6 +100,7 @@ document.addEventListener("DOMContentLoaded", () => {
           ds: null,
           model: "default",
           conf: 0.15,
+          iou: 0.35,
           overwrite: false,
           options: [],
         },
@@ -251,6 +253,7 @@ document.addEventListener("DOMContentLoaded", () => {
         this.alPanel.ds = d;
         this.alPanel.model = "default";
         this.alPanel.conf = 0.15;
+        this.alPanel.iou = 0.35;
         this.alPanel.overwrite = false;
         this.alPanel.options = [];
         try {
@@ -271,6 +274,7 @@ document.addEventListener("DOMContentLoaded", () => {
               model: this.alPanel.model || "default",
               scope: "unlabeled",
               conf: this.alPanel.conf,
+              iou: this.alPanel.iou,
               overwrite: !!this.alPanel.overwrite,
             }),
           });
@@ -293,6 +297,39 @@ document.addEventListener("DOMContentLoaded", () => {
           });
           this.showToast(
             `已删除 ${r.deleted_auto_boxes || 0} 个自动框，涉及 ${r.affected_images || 0} 张图`
+          );
+          await this.loadDatasets();
+        } catch (e) {
+          this.showToast(e.message);
+        }
+      },
+      async runAnnotationDedup(d) {
+        const thrStr = prompt(
+          "清理重复框：同一位置重叠超过该比例时只保留置信度最高的一个。\n"
+            + "默认只处理模型自动标注（人工标注不动）。\nIoU 阈值（0~1，默认 0.6）：",
+          "0.6"
+        );
+        if (thrStr == null) return;
+        const thr = parseFloat(thrStr);
+        if (!(thr > 0 && thr <= 1)) {
+          this.showToast("请输入 0~1 之间的数字");
+          return;
+        }
+        if (
+          !confirm(
+            `将在「${d.name}」中清理自动标注的重复框（IoU≥${thr} 只留置信度最高的）。\n`
+              + "人工标注不受影响。确定？"
+          )
+        )
+          return;
+        try {
+          const r = await YS.api(`/api/datasets/${d.id}/annotations/dedup`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ iou_threshold: thr, scope: "auto" }),
+          });
+          this.showToast(
+            `已删除 ${r.deleted || 0} 个重复框，涉及 ${r.affected_images || 0} 张图`
           );
           await this.loadDatasets();
         } catch (e) {
