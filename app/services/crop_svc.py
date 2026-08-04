@@ -40,8 +40,10 @@ DEFAULTS = {
     # 1.30：必须包含车身，否则模型学不会区分骑手与行人（0.55 只到腰部）
     "bottom_ratio": 1.30,
     # 切图前 person 框几何去重（兜底 NMS 漏网）
-    "dedup_iou": 0.50,  # 两框 IoU 超过此值判为同一个人
-    "dedup_contain": 0.80,  # 小框被大框覆盖超过此比例判为同一个人
+    # 实测标定：0.50/0.80 会把一车载两人的后座乘客误删（骑手与后座小孩 IoU 0.42/contain 0.82）
+    "dedup_iou": 0.60,  # 两框 IoU 超过此值判为同一个人
+    "dedup_contain": 0.99,  # 小框被大框覆盖超过此比例才可能判重复
+    "dedup_min_area_ratio": 0.80,  # 且两框面积须接近，避免「大人套小孩」被误删
     "max_crops": 8000,
     "preview_limit": 20,
     # 质量过滤（保守阈值：宁可多放进来几张暗图，也不误删有效骑手）
@@ -66,6 +68,7 @@ def _params_from(raw: Optional[dict]) -> dict:
     p["bottom_ratio"] = float(p["bottom_ratio"])
     p["dedup_iou"] = float(p["dedup_iou"])
     p["dedup_contain"] = float(p["dedup_contain"])
+    p["dedup_min_area_ratio"] = float(p["dedup_min_area_ratio"])
     p["max_crops"] = int(p["max_crops"])
     p["preview_limit"] = int(p.get("preview_limit") or DEFAULTS["preview_limit"])
     p["min_brightness"] = float(p["min_brightness"])
@@ -116,11 +119,23 @@ def _contain_ratio(small, big) -> float:
     return inter / max((small[2] - small[0]) * (small[3] - small[1]), 1e-6)
 
 
-def dedup_person_boxes(boxes, iou_thr: float = 0.5, contain_thr: float = 0.8):
+def dedup_person_boxes(
+    boxes,
+    iou_thr: float = 0.60,
+    contain_thr: float = 0.99,
+    min_area_ratio: float = 0.80,
+):
     """同一个人的多个重叠框只保留面积最大的那个。
 
     boxes: 每项为 (x1,y1,x2,y2,...) 或 [x1,y1,x2,y2,...]
     大框优先保留：切图 bottom_ratio=1.3 需要完整车身上下文。
+
+    ★ 为什么「包含判据」要额外加面积比限制（min_area_ratio）：
+      一车载两人时，后座乘客（尤其小孩）身体大部分落在骑手框范围内，
+      contain_ratio 很容易超过 0.8，若仅凭这一条就判重复，会把后座乘客整个删掉。
+      实测案例：骑手框与后座小孩框 IoU 仅 0.42、contain 0.82 —— 明显是两个人。
+      加上「两框面积接近」的要求后，大人套小孩的情况就不会被误判。
+      而「多人骑车」本身是要查处的违法行为，漏标代价很大。
     """
 
     def _xyxy(b):
@@ -134,11 +149,19 @@ def dedup_person_boxes(boxes, iou_thr: float = 0.5, contain_thr: float = 0.8):
     kept = []
     for b in ordered:
         bb = _xyxy(b)
+        area_b = _area(b)
         is_dup = False
         for k in kept:
             kk = _xyxy(k)
-            # k 先入且面积更大；判断 b 是否与已保留大框重叠/被包含
-            if _box_iou(bb, kk) > iou_thr or _contain_ratio(bb, kk) > contain_thr:
+            # k 先入且面积更大
+            if _box_iou(bb, kk) > iou_thr:
+                is_dup = True
+                break
+            # 包含判据：仅在两框大小接近时才认定为同一目标
+            if (
+                _contain_ratio(bb, kk) > contain_thr
+                and area_b / max(_area(k), 1e-6) >= min_area_ratio
+            ):
                 is_dup = True
                 break
         if not is_dup:
@@ -273,6 +296,9 @@ def process_one_image(
         tall_enough,
         iou_thr=float(p.get("dedup_iou", DEFAULTS["dedup_iou"])),
         contain_thr=float(p.get("dedup_contain", DEFAULTS["dedup_contain"])),
+        min_area_ratio=float(
+            p.get("dedup_min_area_ratio", DEFAULTS["dedup_min_area_ratio"])
+        ),
     )
     stats["skipped_dup_box"] = before_dedup - len(kept)
     if stats["skipped_dup_box"] > 0:
