@@ -31,12 +31,17 @@ DEFAULTS = {
     "model": "yolo26n.pt",
     "target_class": "person",
     "conf": 0.25,
+    # 检测 NMS 阈值：ultralytics 默认 0.7 太松，同一个人易拆成多框
+    "det_iou": 0.45,
     "imgsz": 1280,
     "min_box_h": 100,
     "pad_ratio": 0.25,
     "top_ratio": -0.15,
     # 1.30：必须包含车身，否则模型学不会区分骑手与行人（0.55 只到腰部）
     "bottom_ratio": 1.30,
+    # 切图前 person 框几何去重（兜底 NMS 漏网）
+    "dedup_iou": 0.50,  # 两框 IoU 超过此值判为同一个人
+    "dedup_contain": 0.80,  # 小框被大框覆盖超过此比例判为同一个人
     "max_crops": 8000,
     "preview_limit": 20,
     # 质量过滤（保守阈值：宁可多放进来几张暗图，也不误删有效骑手）
@@ -53,11 +58,14 @@ def _params_from(raw: Optional[dict]) -> dict:
             if k in raw and raw[k] is not None:
                 p[k] = raw[k]
     p["conf"] = float(p["conf"])
+    p["det_iou"] = float(p["det_iou"])
     p["imgsz"] = int(p["imgsz"])
     p["min_box_h"] = int(p["min_box_h"])
     p["pad_ratio"] = float(p["pad_ratio"])
     p["top_ratio"] = float(p["top_ratio"])
     p["bottom_ratio"] = float(p["bottom_ratio"])
+    p["dedup_iou"] = float(p["dedup_iou"])
+    p["dedup_contain"] = float(p["dedup_contain"])
     p["max_crops"] = int(p["max_crops"])
     p["preview_limit"] = int(p.get("preview_limit") or DEFAULTS["preview_limit"])
     p["min_brightness"] = float(p["min_brightness"])
@@ -85,6 +93,57 @@ def _crop_quality_reject(crop: Image.Image, p: dict) -> Optional[str]:
 
 def _match_class_name(name: str, target: str) -> bool:
     return str(name).strip().lower() == str(target).strip().lower()
+
+
+def _box_iou(a, b) -> float:
+    """两框 IoU，a/b 均为 (x1,y1,x2,y2)。"""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / max(ua, 1e-6)
+
+
+def _contain_ratio(small, big) -> float:
+    """small 被 big 覆盖的面积比例——处理「一个框套在另一个里面」的情况。"""
+    ix1, iy1 = max(small[0], big[0]), max(small[1], big[1])
+    ix2, iy2 = min(small[2], big[2]), min(small[3], big[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    return inter / max((small[2] - small[0]) * (small[3] - small[1]), 1e-6)
+
+
+def dedup_person_boxes(boxes, iou_thr: float = 0.5, contain_thr: float = 0.8):
+    """同一个人的多个重叠框只保留面积最大的那个。
+
+    boxes: 每项为 (x1,y1,x2,y2,...) 或 [x1,y1,x2,y2,...]
+    大框优先保留：切图 bottom_ratio=1.3 需要完整车身上下文。
+    """
+
+    def _xyxy(b):
+        return (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+
+    def _area(b) -> float:
+        x1, y1, x2, y2 = _xyxy(b)
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    ordered = sorted(boxes, key=_area, reverse=True)
+    kept = []
+    for b in ordered:
+        bb = _xyxy(b)
+        is_dup = False
+        for k in kept:
+            kk = _xyxy(k)
+            # k 先入且面积更大；判断 b 是否与已保留大框重叠/被包含
+            if _box_iou(bb, kk) > iou_thr or _contain_ratio(bb, kk) > contain_thr:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(b)
+    return kept
 
 
 def crop_box_region(
@@ -122,6 +181,7 @@ def _detect_xyxy(
     conf: float,
     imgsz: int,
     target_class: str,
+    det_iou: float = 0.45,
 ) -> list[tuple[float, float, float, float, float, str]]:
     """返回 [(x1,y1,x2,y2,conf,class_name), ...] 像素坐标。"""
     model = engine.load_model(model_path, prefer_openvino=False)
@@ -131,6 +191,7 @@ def _detect_xyxy(
     results = model.predict(
         source=str(image_path),
         conf=conf,
+        iou=det_iou,  # 收紧 NMS，减少同一个人多框
         imgsz=imgsz,
         device="cpu",
         half=False,
@@ -173,11 +234,14 @@ def process_one_image(
     stats = {
         "detected": 0,
         "skipped_small": 0,
+        "skipped_dup_box": 0,  # 同一个人多框（检测重叠），非 sha1 内容重复
         "skipped_dark": 0,
         "skipped_aspect": 0,
         "crops": [],  # list of (filename, bytes)
         "crop_sizes": [],  # list of (w, h)，用于汇总中位尺寸
         "no_target": False,
+        # 调试：被几何去重掉的框 [(x1,y1,x2,y2,conf), ...]，供验收抽查
+        "dropped_dup_boxes": [],
     }
     if max_remaining <= 0:
         return stats
@@ -188,22 +252,43 @@ def process_one_image(
         conf=p["conf"],
         imgsz=p["imgsz"],
         target_class=p["target_class"],
+        det_iou=float(p.get("det_iou", DEFAULTS["det_iou"])),
     )
     stats["detected"] = len(boxes)
     if not boxes:
         stats["no_target"] = True
         return stats
 
+    # 1) 过小框先剔除  2) 几何去重只保留大框  3) 再切图
+    tall_enough = []
+    for b in boxes:
+        x1, y1, x2, y2 = b[0], b[1], b[2], b[3]
+        if (y2 - y1) < p["min_box_h"]:
+            stats["skipped_small"] += 1
+        else:
+            tall_enough.append(b)
+
+    before_dedup = len(tall_enough)
+    kept = dedup_person_boxes(
+        tall_enough,
+        iou_thr=float(p.get("dedup_iou", DEFAULTS["dedup_iou"])),
+        contain_thr=float(p.get("dedup_contain", DEFAULTS["dedup_contain"])),
+    )
+    stats["skipped_dup_box"] = before_dedup - len(kept)
+    if stats["skipped_dup_box"] > 0:
+        kept_ids = {id(b) for b in kept}
+        for b in tall_enough:
+            if id(b) not in kept_ids:
+                stats["dropped_dup_boxes"].append(
+                    (float(b[0]), float(b[1]), float(b[2]), float(b[3]), float(b[4]))
+                )
+
     with Image.open(image_path) as im:
         im = im.convert("RGB")
         W, H = im.size
         stem = _stem_safe(src_filename)
         idx = 0
-        for x1, y1, x2, y2, conf, _cn in boxes:
-            bh = y2 - y1
-            if bh < p["min_box_h"]:
-                stats["skipped_small"] += 1
-                continue
+        for x1, y1, x2, y2, conf, _cn in kept:
             cx1, cy1, cx2, cy2 = crop_box_region(
                 W,
                 H,
@@ -340,9 +425,10 @@ def run_crop_import(task: dict) -> None:
         imported_total = 0
         detected_total = 0
         skipped_small = 0
+        skipped_dup_box_total = 0  # 重叠重复（同人多框）
         skipped_dark = 0
         skipped_aspect = 0
-        skipped_dup_total = 0
+        skipped_dup_total = 0  # 内容重复（sha1）
         skipped_bad_total = 0
         no_target_files: list[str] = []
         done_imgs = 0
@@ -383,6 +469,7 @@ def run_crop_import(task: dict) -> None:
 
             detected_total += st["detected"]
             skipped_small += st["skipped_small"]
+            skipped_dup_box_total += int(st.get("skipped_dup_box") or 0)
             skipped_dark += int(st.get("skipped_dark") or 0)
             skipped_aspect += int(st.get("skipped_aspect") or 0)
             if st["no_target"]:
@@ -425,17 +512,19 @@ def run_crop_import(task: dict) -> None:
                 median_w = (sw[mid - 1] + sw[mid]) // 2
                 median_h = (sh[mid - 1] + sh[mid]) // 2
             median_size_str = f"，中位尺寸 {median_w}×{median_h}"
-        # 闭合：检出 = 过小 + 过暗 + 比例异常 + 重复 + 损坏 + 入库
+        # 闭合：检出 = 重叠重复 + 过小 + 过暗 + 比例异常 + 内容重复 + 损坏 + 入库
         summary = (
             f"处理大图 {done_imgs} 张，检出目标 {detected_total} 个，"
+            f"跳过重叠重复 {skipped_dup_box_total} 个，"
             f"跳过过小 {skipped_small} 个，跳过过暗 {skipped_dark} 个，"
-            f"跳过比例异常 {skipped_aspect} 个，跳过重复 {skipped_dup_total} 个"
+            f"跳过比例异常 {skipped_aspect} 个，跳过内容重复 {skipped_dup_total} 个"
             + (f"，跳过损坏 {skipped_bad_total} 个" if skipped_bad_total else "")
             + f"，切图入库 {imported_total} 张{median_size_str}，"
             f"其中 {len(no_target_files)} 张大图未检出任何目标"
         )
         accounted = (
-            skipped_small
+            skipped_dup_box_total
+            + skipped_small
             + skipped_dark
             + skipped_aspect
             + skipped_dup_total
@@ -444,9 +533,11 @@ def run_crop_import(task: dict) -> None:
         )
         if detected_total != accounted:
             logger.warning(
-                "切图统计未闭合：检出=%s 合计=%s（过小=%s 过暗=%s 比例=%s 重复=%s 损坏=%s 入库=%s）",
+                "切图统计未闭合：检出=%s 合计=%s"
+                "（重叠=%s 过小=%s 过暗=%s 比例=%s 内容重复=%s 损坏=%s 入库=%s）",
                 detected_total,
                 accounted,
+                skipped_dup_box_total,
                 skipped_small,
                 skipped_dark,
                 skipped_aspect,
@@ -458,6 +549,7 @@ def run_crop_import(task: dict) -> None:
         result = {
             "source_images": done_imgs,
             "detected": detected_total,
+            "skipped_dup_box": skipped_dup_box_total,
             "skipped_small": skipped_small,
             "skipped_dark": skipped_dark,
             "skipped_aspect": skipped_aspect,

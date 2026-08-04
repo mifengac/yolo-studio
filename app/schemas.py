@@ -85,12 +85,17 @@ class CropImportParams(BaseModel):
     model: str = "yolo26n.pt"
     target_class: str = "person"
     conf: float = 0.25
+    # 检测 NMS 阈值（默认 0.45；ultralytics 默认 0.7 太松，同人易多框）
+    det_iou: float = 0.45
     imgsz: int = 1280
     min_box_h: int = 100
     pad_ratio: float = 0.25
     top_ratio: float = -0.15
     # 1.30：取到 person 框高的 130%，包含车身，才能区分骑手与行人
     bottom_ratio: float = 1.30
+    # 切图前 person 框几何去重
+    dedup_iou: float = 0.50
+    dedup_contain: float = 0.80
     max_crops: int = 8000
     preview_limit: int = 20
 
